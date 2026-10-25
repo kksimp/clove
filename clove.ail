@@ -1,0 +1,311 @@
+## clove: an archiver written in AIL, with its own context-mixing codec (cm/).
+##
+##     ail run clove.ail a [-b BLOCK_KB] ARCHIVE PATH...   add files and directories
+##     ail run clove.ail x ARCHIVE [DIR]                   extract (into DIR, default .)
+##     ail run clove.ail l ARCHIVE                         list
+##     ail run clove.ail t ARCHIVE                         test: decode every block, check CRCs
+##     ail run clove.ail bench FILE [-b BLOCK_KB]          ratio and speed, with a round-trip check
+##
+## Blocks are compressed and decoded on all cores (`par for`). Format: README.md.
+
+use cm
+
+MAGIC := b"CLV1"
+BATCH := 8
+
+USAGE := """
+    usage: clove COMMAND ...
+      a [-b BLOCK_KB] ARCHIVE PATH...   add files and directories (block size default 4096 KB)
+      x ARCHIVE [DIR]                   extract into DIR (default .)
+      l ARCHIVE                         list
+      t ARCHIVE                         test every block
+      bench FILE [-b BLOCK_KB]          ratio, speed and round-trip check
+    """
+
+error enum CloveError
+    Usage(text str) "{text}"
+    Bad(why str) "bad archive: {why}"
+
+struct Entry
+    name str
+    size int
+    bsize int
+    clens List[int]
+    crcs List[int]
+    start int
+    next int
+
+struct Packed
+    data bytes
+    clens List[int]
+    crcs List[int]
+
+fn to_ints(b bytes) List[int]
+    mut out := List[int]()
+    for x in b
+        out.push(x.to_int())
+    out
+
+fn to_bytes(xs List[int]) bytes
+    bytes.from_list([x.to_u8() for x in xs])
+
+fn put(mut out List[int], v int, nbytes int)
+    for i in 0..nbytes
+        out.push(v.shr(8 * i).bit_and(255))
+
+fn get(b bytes, pos int, nbytes int) int ! CloveError
+    if pos + nbytes > b.len()
+        return Bad(why: "truncated at byte {pos}")
+    mut v := 0
+    for i in 0..nbytes
+        v += b[pos + i].to_int().shl(8 * i)
+    v
+
+fn nblocks(size int, bsize int) int
+    (size + bsize - 1) / bsize
+
+fn raw_len(size int, bsize int, i int) int
+    bsize.min(size - i * bsize)
+
+## Compresses `data` block by block (a block that does not shrink is stored).
+fn pack(data bytes, bsize int) Packed
+    nb := nblocks(data.len(), bsize)
+    mut parts := [List[int]() for _ in 0..nb]
+    mut crcs := [0 for _ in 0..nb]
+    mut all := b""
+    mut first := 0
+    while first < nb
+        last := (first + BATCH).min(nb)
+        par for i in first..last
+            s := i * bsize
+            raw := data[s..(s + bsize).min(data.len())]
+            crcs[i] = hash.crc32(raw)
+            blk := to_ints(raw)
+            c := cm.compress(blk)
+            parts[i] = if c.len() < blk.len() then c else blk
+        for i in first..last
+            all = all + to_bytes(parts[i])
+        first = last
+    Packed(data: all, clens: [p.len() for p in parts], crcs: crcs)
+
+## Decodes blocks `first..last` of the packed bytes on all cores; a block that
+## fails its length or CRC check comes back empty.
+fn decode(
+    data bytes,
+    offs List[int],
+    clens List[int],
+    rawlens List[int],
+    crcs List[int],
+    first int,
+    last int,
+) List[List[int]]
+    mut out := [List[int]() for _ in 0..clens.len()]
+    par for i in first..last
+        comp := to_ints(data[offs[i]..offs[i] + clens[i]])
+        raw := if clens[i] == rawlens[i] then comp else cm.decompress(comp, rawlens[i])
+        ok := raw.len() == rawlens[i] and hash.crc32(to_bytes(raw)) == crcs[i]
+        out[i] = if ok then raw else List[int]()
+    out
+
+## Decodes and checks every block of one file; appends the data to `dest` unless it is "".
+fn unpack(
+    name str,
+    data bytes,
+    clens List[int],
+    rawlens List[int],
+    crcs List[int],
+    dest str,
+) ! CloveError | fs.IoError
+    mut offs := List[int]()
+    mut o := 0
+    for c in clens
+        offs.push(o)
+        o += c
+    if dest != ""
+        fs.write_bytes(dest, b"")?
+    mut first := 0
+    while first < clens.len()
+        last := (first + BATCH).min(clens.len())
+        out := decode(data, offs, clens, rawlens, crcs, first, last)
+        for i in first..last
+            if out[i].len() != rawlens[i]
+                return Bad(why: "{name}: block {i} is damaged")
+            if dest != ""
+                fs.append_bytes(dest, to_bytes(out[i]))?
+        first = last
+
+fn read_entry(b bytes, pos int) Entry ! CloveError
+    nlen := get(b, pos, 2)?
+    name := b[pos + 2..pos + 2 + nlen].text()
+    mut p := pos + 2 + nlen
+    size := get(b, p, 8)?
+    bsize := get(b, p + 8, 4)?
+    if bsize <= 0
+        return Bad(why: "{name}: block size 0")
+    nb := get(b, p + 12, 4)?
+    if nb != nblocks(size, bsize)
+        return Bad(why: "{name}: block count")
+    p += 16
+    mut clens := List[int]()
+    mut crcs := List[int]()
+    mut total := 0
+    for _ in 0..nb
+        c := get(b, p, 4)?
+        clens.push(c)
+        crcs.push(get(b, p + 4, 4)?)
+        total += c
+        p += 8
+    if p + total > b.len()
+        return Bad(why: "{name}: truncated data")
+    Entry(name: name, size: size, bsize: bsize, clens: clens, crcs: crcs, start: p, next: p + total)
+
+fn read_all(b bytes, path str) List[Entry] ! CloveError
+    if b.len() < 4 or b[0..4] != MAGIC
+        return Bad(why: "{path}: not a CLV1 archive")
+    mut entries := List[Entry]()
+    mut pos := 4
+    while pos < b.len()
+        e := read_entry(b, pos)?
+        entries.push(e)
+        pos = e.next
+    entries
+
+fn rawlens_of(e Entry) List[int]
+    [raw_len(e.size, e.bsize, i) for i in 0..e.clens.len()]
+
+fn entry_bytes(name str, size int, bsize int, p Packed) bytes
+    nbytes := name.to_bytes()
+    mut h := List[int]()
+    put(mut h, nbytes.len(), 2)
+    h.extend(to_ints(nbytes))
+    put(mut h, size, 8)
+    put(mut h, bsize, 4)
+    put(mut h, p.clens.len(), 4)
+    for i in 0..p.clens.len()
+        put(mut h, p.clens[i], 4)
+        put(mut h, p.crcs[i], 4)
+    to_bytes(h)
+
+fn collect(paths List[str]) List[str] ! fs.IoError
+    mut files := List[str]()
+    for p in paths
+        if fs.metadata(p)?.is_dir
+            for f in fs.walk(p)?.sorted()
+                files.push(f)
+        else
+            files.push(p)
+    files
+
+fn safe(name str) bool
+    if name == "" or name.starts_with("/") or name.contains(":")
+        return false
+    for part in name.split("/")
+        if part == ".."
+            return false
+    true
+
+fn cmd_add(archive str, paths List[str], bsize int) ! CloveError | fs.IoError
+    files := collect(paths)?
+    fs.write_bytes(archive, MAGIC)?
+    mut total := 0
+    mut packed := 4
+    for f in files
+        if not safe(f)
+            return Usage(text: "refusing the name {f}")
+        data := fs.read_bytes(f)?
+        p := pack(data, bsize)
+        fs.append_bytes(archive, entry_bytes(f, data.len(), bsize, p))?
+        fs.append_bytes(archive, p.data)?
+        packed += p.data.len()
+        total += data.len()
+        print("{f}  {data.len()}")
+    print("{files.len()} files, {total} -> {packed} bytes")
+
+fn cmd_extract(archive str, dir str) ! CloveError | fs.IoError
+    b := fs.read_bytes(archive)?
+    for e in read_all(b, archive)?
+        if not safe(e.name)
+            return Bad(why: "unsafe name {e.name}")
+        dest := if dir == "." then e.name else "{dir}/{e.name}"
+        parts := dest.split("/")
+        if parts.len() > 1
+            fs.make_dir(parts[0..parts.len() - 1].join("/"))?
+        unpack(e.name, b[e.start..e.next], e.clens, rawlens_of(e), e.crcs, dest)?
+        print("{e.name}")
+
+fn cmd_list(archive str) ! CloveError | fs.IoError
+    b := fs.read_bytes(archive)?
+    es := read_all(b, archive)?
+    mut size := 0
+    mut packed := 0
+    for e in es
+        c := e.next - e.start
+        print("{e.size:>12} {c:>12}  {e.name}")
+        size += e.size
+        packed += c
+    print("{size:>12} {packed:>12}  {es.len()} files")
+
+fn cmd_test(archive str) ! CloveError | fs.IoError
+    b := fs.read_bytes(archive)?
+    es := read_all(b, archive)?
+    for e in es
+        unpack(e.name, b[e.start..e.next], e.clens, rawlens_of(e), e.crcs, "")?
+    print("ok: {es.len()} files")
+
+fn mb_per_s(n int, ms int) str
+    if ms <= 0
+        return "-"
+    mbs := n.to_float() / 1048576.0 / (ms.to_float() / 1000.0)
+    "{mbs:.2}"
+
+fn cmd_bench(path str, bsize int) ! CloveError | fs.IoError
+    data := fs.read_bytes(path)?
+    t0 := time.now_ms()
+    p := pack(data, bsize)
+    t1 := time.now_ms()
+    nb := p.clens.len()
+    unpack(path, p.data, p.clens, [raw_len(data.len(), bsize, i) for i in 0..nb], p.crcs, "")?
+    t2 := time.now_ms()
+    ratio := data.len().to_float() / p.data.len().max(1).to_float()
+    print("{path}: {data.len()} -> {p.data.len()} bytes, ratio {ratio:.3}")
+    print("compress   {t1 - t0} ms  {mb_per_s(data.len(), t1 - t0)} MB/s")
+    print("decompress {t2 - t1} ms  {mb_per_s(data.len(), t2 - t1)} MB/s")
+    print("verified: every block decoded and matched its CRC")
+
+struct Opts
+    bsize int
+    words List[str]
+
+fn parse(args List[str]) Opts ! CloveError
+    mut o := Opts(bsize: 4194304, words: [])
+    mut i := 0
+    while i < args.len()
+        if args[i] == "-b"
+            word := if i + 1 < args.len() then args[i + 1] else ""
+            n := word.to_int() else return Usage(text: "-b needs a number of KB")
+            o.bsize = n * 1024
+            i += 2
+        else
+            o.words.push(args[i])
+            i += 1
+    if o.bsize < 4096
+        return Usage(text: "the block is at least 4 KB")
+    o
+
+fn main() !
+    args := env.args()
+    if args.len() < 2
+        print(USAGE)
+        return
+    o := parse(args[1..])?
+    w := o.words
+    match args[0]
+        "a" =>
+            if w.len() < 2
+                return Usage(text: "a needs ARCHIVE and PATH...")
+            cmd_add(w[0], w[1..], o.bsize)?
+        "x" => cmd_extract(w[0], if w.len() > 1 then w[1] else ".")?
+        "l" => cmd_list(w[0])?
+        "t" => cmd_test(w[0])?
+        "bench" => cmd_bench(w[0], o.bsize)?
+        _ => print(USAGE)
