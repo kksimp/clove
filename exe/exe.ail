@@ -44,7 +44,10 @@ pub fn detect(b bytes) int
 
 ## x86 near call/jump targets: the 32-bit displacement after E8/E9 is converted
 ## when its top byte is 00 or FF (a near target), as a 25-bit value, so the top
-## byte stays 00 or FF and the decoder makes the same choice.
+## byte stays 00 or FF and the decoder makes the same choice. The four bytes after
+## any E8/E9 are skipped, converted or not: an E8 inside them would read its top
+## byte from a later operand that conversion rewrites, and the decoder would decide
+## differently.
 fn x86(d List[u8], enc bool) List[u8]
     n := d.len()
     mut out := List[u8]()
@@ -65,8 +68,11 @@ fn x86(d List[u8], enc bool) List[u8]
                 out.push(w.shr(8).bit_and(255).to_u8())
                 out.push(w.shr(16).bit_and(255).to_u8())
                 out.push((if w.shr(24) == 1 then 255 else 0).to_u8())
-                i += 5
-                continue
+            else
+                for k in 1..5
+                    out.push(d[i + k])
+            i += 5
+            continue
         i += 1
     out
 
@@ -126,6 +132,15 @@ fn sample(n int, seed int) List[u8]
             d.extend([(0).to_u8(), (16).to_u8(), (0).to_u8(), (148).to_u8()])
         for kind in [X86, ARM64]
             assert_eq(filter(filter(d, kind, true), kind, false), d)
+
+## An unconverted E8 whose top byte is the first operand byte of a converted E8
+## three bytes later (from a real binary): at some positions the conversion makes
+## that byte 00 or FF, so a decoder reading it would convert the first E8 too.
+@test fn overlapping_calls_invert()
+    for m in 0..256
+        mut d := [(0).to_u8() for _ in 0..m]
+        d.extend(b"\xe8\x31\xc0\xe8\x7a\x60\xfc\xff\x48\x8b".to_list())
+        assert_eq(filter(filter(d, X86, true), X86, false), d)
 
 @test fn repeated_calls_become_repeated_bytes()
     mut d := List[u8]()
