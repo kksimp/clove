@@ -31,7 +31,7 @@ for f in "$c"/*; do
   name=$(basename "$f"); size=$(wc -c <"$f")
   for m in fast max; do
     s=$(date +%s%N)
-    $tm $tmflag "$tmp/clove" a -m $m "$tmp/a.clove" "$f" >/dev/null 2>"$tmp/t1"
+    $tm $tmflag "$tmp/clove" a -m $m -b 4096 "$tmp/a.clove" "$f" >/dev/null 2>"$tmp/t1"
     e=$(date +%s%N)
     $tm $tmflag "$tmp/clove" x "$tmp/a.clove" "$tmp/x" >/dev/null 2>"$tmp/t2"
     e2=$(date +%s%N)

@@ -1,0 +1,167 @@
+## Executable filters. Machine code stores branch targets relative to the
+## instruction, so the same callee looks different at every call site. These
+## filters rewrite the targets of x86-64 `call`/`jmp rel32` (E8/E9) and ARM64 `bl`
+## to absolute positions in the block before compression, so repeated calls
+## become repeated bytes, and undo it after decoding. Both directions make the same
+## decisions from bytes the filter never changes, so they are exact inverses.
+
+NONE := 0
+X86 := 1
+ARM64 := 2
+
+fn le(b bytes, pos int, n int) int
+    mut v := 0
+    for i in 0..n
+        v += b[pos + i].to_int().shl(8 * i)
+    v
+
+## The filter for a file's machine code, from its ELF, PE or Mach-O header.
+pub fn detect(b bytes) int
+    n := b.len()
+    if n >= 20 and b[0..4] == b"\x7fELF"
+        m := le(b, 18, 2)
+        if m == 62
+            return X86
+        if m == 183
+            return ARM64
+        return NONE
+    if n >= 64 and b[0..2] == b"MZ"
+        pe := le(b, 60, 4)
+        if pe + 6 <= n and b[pe..pe + 4] == b"PE\x00\x00"
+            m := le(b, pe + 4, 2)
+            if m == 34404
+                return X86
+            if m == 43620
+                return ARM64
+        return NONE
+    if n >= 8 and b[0..4] == b"\xcf\xfa\xed\xfe"
+        cpu := le(b, 4, 4)
+        if cpu == 16777223
+            return X86
+        if cpu == 16777228
+            return ARM64
+    NONE
+
+## x86 near call/jump targets: the 32-bit displacement after E8/E9 is converted
+## when its top byte is 00 or FF (a near target), as a 25-bit value, so the top
+## byte stays 00 or FF and the decoder makes the same choice. The four bytes after
+## any E8/E9 are skipped, converted or not: an E8 inside them would read its top
+## byte from a later operand that conversion rewrites, and the decoder would decide
+## differently.
+fn x86(d List[u8], enc bool) List[u8]
+    n := d.len()
+    mut out := List[u8]()
+    mut i := 0
+    while i < n
+        op := d[i].to_int()
+        out.push(d[i])
+        if (op == 232 or op == 233) and i + 5 <= n
+            top := d[i + 4].to_int()
+            if top == 0 or top == 255
+                v := d[i + 1].to_int()
+                    + d[i + 2].to_int().shl(8)
+                    + d[i + 3].to_int().shl(16)
+                    + (if top == 255 then 16777216 else 0)
+                p := i + 5
+                w := (if enc then v + p else v - p).bit_and(33554431)
+                out.push(w.bit_and(255).to_u8())
+                out.push(w.shr(8).bit_and(255).to_u8())
+                out.push(w.shr(16).bit_and(255).to_u8())
+                out.push((if w.shr(24) == 1 then 255 else 0).to_u8())
+            else
+                for k in 1..5
+                    out.push(d[i + k])
+            i += 5
+            continue
+        i += 1
+    out
+
+## ARM64 `bl` (top six bits 100101): the 26-bit word offset becomes absolute.
+fn arm64(d List[u8], enc bool) List[u8]
+    n := d.len()
+    mut out := List[u8]()
+    mut i := 0
+    while i + 4 <= n
+        w := d[i].to_int()
+            + d[i + 1].to_int().shl(8)
+            + d[i + 2].to_int().shl(16)
+            + d[i + 3].to_int().shl(24)
+        if w.shr(26) == 37
+            pc := i / 4
+            imm := w.bit_and(67108863)
+            w2 := (if enc then imm + pc else imm - pc).bit_and(67108863) + 2483027968
+            for k in 0..4
+                out.push(w2.shr(8 * k).bit_and(255).to_u8())
+        else
+            for k in 0..4
+                out.push(d[i + k])
+        i += 4
+    while i < n
+        out.push(d[i])
+        i += 1
+    out
+
+## Applies (enc) or undoes (not enc) filter `kind` on one block.
+pub fn filter(d List[u8], kind int, enc bool) List[u8]
+    if kind == X86
+        return x86(d, enc)
+    if kind == ARM64
+        return arm64(d, enc)
+    d
+
+fn sample(n int, seed int) List[u8]
+    mut xs := List[u8]()
+    mut x := seed
+    for _ in 0..n
+        x = (x * 1103515245 + 12345).bit_and(2147483647)
+        xs.push(x.shr(16).bit_and(255).to_u8())
+    xs
+
+@test fn filters_invert_exactly()
+    for seed in [1, 2, 3]
+        mut d := sample(5000, seed)
+        # plant real-looking calls and branches
+        for k in 0..200
+            d.extend([
+                (232).to_u8(),
+                (k * 7).bit_and(255).to_u8(),
+                (16).to_u8(),
+                (0).to_u8(),
+                (0).to_u8(),
+            ])
+            d.extend([(0).to_u8(), (16).to_u8(), (0).to_u8(), (148).to_u8()])
+        for kind in [X86, ARM64]
+            assert_eq(filter(filter(d, kind, true), kind, false), d)
+
+## An unconverted E8 whose top byte is the first operand byte of a converted E8
+## three bytes later (from a real binary): at some positions the conversion makes
+## that byte 00 or FF, so a decoder reading it would convert the first E8 too.
+@test fn overlapping_calls_invert()
+    for m in 0..256
+        mut d := [(0).to_u8() for _ in 0..m]
+        d.extend(b"\xe8\x31\xc0\xe8\x7a\x60\xfc\xff\x48\x8b".to_list())
+        assert_eq(filter(filter(d, X86, true), X86, false), d)
+
+@test fn repeated_calls_become_repeated_bytes()
+    mut d := List[u8]()
+    for k in 0..50
+        # call to absolute 4096 from position k*5: displacement 4096 - (k*5 + 5)
+        rel := 4096 - (k * 5 + 5)
+        d.extend([
+            (232).to_u8(),
+            rel.bit_and(255).to_u8(),
+            rel.shr(8).bit_and(255).to_u8(),
+            (0).to_u8(),
+            (0).to_u8(),
+        ])
+    f := filter(d, X86, true)
+    assert_eq(f[1..5], f[6..10])
+
+@test fn detects_headers()
+    mut elf := b"\x7fELF".to_list()
+    for _ in 0..14
+        elf.push((0).to_u8())
+    elf.extend([(62).to_u8(), (0).to_u8(), (0).to_u8(), (0).to_u8()])
+    assert_eq(detect(bytes.from_list(elf)), X86)
+    assert_eq(detect(b"\xcf\xfa\xed\xfe\x0c\x00\x00\x01"), ARM64)
+    assert_eq(detect(b"plain text, not a program"), NONE)
