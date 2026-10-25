@@ -1,0 +1,224 @@
+## Clove's search layer: a per-block trigram Bloom filter kept in a trailer after the
+## last block, and the scan that runs on the blocks the filter lets through.
+##
+## Trailer: for each block in archive order
+##     u32 newline count | u8 text flag (no NUL byte) | u8 k | 2^k bits of Bloom filter (k 8..15)
+## then u32 trailer length (this word and the magic included) | "CLX1".
+## A trigram is folded to lower case ASCII, so one filter answers both `grep` and `grep -i`.
+## A block's filter also holds the trigrams that start in its last two bytes, so a match
+## that crosses into the next block of the same file is found from the first block.
+
+MAGIC := b"CLX1"
+MAXK := 15
+MINK := 8
+
+pub struct Index
+    ok bool
+    nl List[int]
+    text List[int]
+    ks List[int]
+    offs List[int]
+
+pub fn pow2(k int) int
+    v := 1
+    v.shl(k)
+
+fn lower(c int) int
+    if c >= 65 and c <= 90
+        return c + 32
+    c
+
+## The Bloom slot (15 bits) of the three bytes a, b, c.
+fn slot(a int, b int, c int) int
+    t := lower(a).shl(16) + lower(b).shl(8) + lower(c)
+    (t * 2654435761).bit_and(4294967295).shr(17)
+
+fn le(mut out List[int], v int, nbytes int)
+    for i in 0..nbytes
+        out.push(v.shr(8 * i).bit_and(255))
+
+fn popcount(xs List[int]) int
+    mut n := 0
+    for x in xs
+        mut v := x
+        while v != 0
+            v = v.bit_and(v - 1)
+            n += 1
+    n
+
+fn fold_half(bm List[int]) List[int]
+    h := bm.len() / 2
+    [bm[j].bit_or(bm[j + h]) for j in 0..h]
+
+## The trailer entry of the block data[s..e]: counts and Bloom filter, shrunk while sparse.
+fn entry(data bytes, s int, e int) List[int]
+    mut bm := [0 for _ in 0..(pow2(MAXK) / 8)]
+    mut nl := 0
+    mut text := 1
+    for i in s..e
+        c := data[i].to_int()
+        if c == 10
+            nl += 1
+        if c == 0
+            text = 0
+        if i + 2 < data.len()
+            p := slot(c, data[i + 1].to_int(), data[i + 2].to_int())
+            bm[p.shr(3)] = bm[p.shr(3)].bit_or(pow2(p.bit_and(7)))
+    mut k := MAXK
+    while k > MINK
+        half := fold_half(bm)
+        if popcount(half) * 10 > half.len() * 8 * 3
+            break
+        bm = half
+        k -= 1
+    mut out := List[int]()
+    le(mut out, nl, 4)
+    out.push(text)
+    out.push(k)
+    out.extend(bm)
+    out
+
+## The trailer entries of one file's blocks, one block per core.
+pub fn file_entries(data bytes, bsize int) List[int]
+    nb := (data.len() + bsize - 1) / bsize
+    mut parts := [List[int]() for _ in 0..nb]
+    par for i in 0..nb
+        parts[i] = entry(data, i * bsize, (i * bsize + bsize).min(data.len()))
+    mut all := List[int]()
+    for p in parts
+        all.extend(p)
+    all
+
+## The bytes appended after the last block, given every file's entries joined.
+pub fn trailer(entries List[int]) List[int]
+    mut out := entries
+    le(mut out, entries.len() + 8, 4)
+    out.extend([67, 76, 88, 49])
+    out
+
+fn word(b bytes, pos int) int
+    b[pos].to_int() + b[pos + 1].to_int().shl(8) + b[pos + 2].to_int().shl(16) + b[pos + 3].to_int().shl(24)
+
+## Reads the trailer of an archive with `nblk` blocks; `ok` is false when there is none
+## or it does not fit, and the caller then scans every block.
+pub fn load(b bytes, nblk int) Index
+    none_found := Index(ok: false, nl: [], text: [], ks: [], offs: [])
+    n := b.len()
+    if n < 8 or b[n - 4..n] != MAGIC
+        return none_found
+    tlen := word(b, n - 8)
+    if tlen < 8 or tlen > n
+        return none_found
+    end := n - 8
+    mut p := n - tlen
+    mut ix := Index(ok: true, nl: [], text: [], ks: [], offs: [])
+    for _ in 0..nblk
+        if p + 6 > end
+            return none_found
+        k := b[p + 5].to_int()
+        if k < MINK or k > MAXK or p + 6 + pow2(k) / 8 > end
+            return none_found
+        ix.nl.push(word(b, p))
+        ix.text.push(b[p + 4].to_int())
+        ix.ks.push(k)
+        ix.offs.push(p + 6)
+        p += 6 + pow2(k) / 8
+    if p != end
+        return none_found
+    ix
+
+## Does block `g`'s filter hold the slot s?
+fn has(ix Index, b bytes, g int, s int) bool
+    q := s.bit_and(pow2(ix.ks[g]) - 1)
+    b[ix.offs[g] + q.shr(3)].to_int().shr(q.bit_and(7)).bit_and(1) == 1
+
+fn slots(pat bytes) List[int]
+    [slot(pat[i].to_int(), pat[i + 1].to_int(), pat[i + 2].to_int()) for i in 0..pat.len() - 2]
+
+## The blocks (positions inside the file) of the file whose first global block is `first`
+## and that has `nb` blocks, that can hold a match that starts in them.
+pub fn candidates(ix Index, b bytes, first int, nb int, pat bytes, binary bool) List[int]
+    mut out := List[int]()
+    ss := slots(pat)
+    for j in 0..nb
+        g := first + j
+        if not binary and ix.text[g] == 0
+            continue
+        if ss.len() == 0
+            out.push(j)
+            continue
+        mut ok := has(ix, b, g, ss[0])
+        for s in ss
+            if ok and not has(ix, b, g, s) and not (j + 1 < nb and has(ix, b, g + 1, s))
+                ok = false
+        if ok
+            out.push(j)
+    out
+
+fn same(buf bytes, i int, pat bytes, fold bool) bool
+    for k in 0..pat.len()
+        a := buf[i + k].to_int()
+        c := pat[k].to_int()
+        if fold
+            if lower(a) != lower(c)
+                return false
+        elif a != c
+            return false
+    true
+
+## Where the matches that start in buf[0..own) are, the first of each line only.
+pub fn scan(buf bytes, own int, pat bytes, fold bool) List[int]
+    mut hits := List[int]()
+    m := pat.len()
+    mut i := 0
+    while i < own and i + m <= buf.len()
+        if same(buf, i, pat, fold)
+            hits.push(i)
+            mut j := i
+            while j < buf.len() and buf[j] != 10
+                j += 1
+            i = j + 1
+        else
+            i += 1
+    hits
+
+pub fn line_start(buf bytes, p int) int
+    mut i := p
+    while i > 0 and buf[i - 1] != 10
+        i -= 1
+    i
+
+pub fn line_end(buf bytes, p int) int
+    mut j := p
+    while j < buf.len() and buf[j] != 10
+        j += 1
+    j
+
+pub fn newlines(buf bytes, upto int) int
+    mut n := 0
+    for i in 0..upto
+        if buf[i] == 10
+            n += 1
+    n
+
+@test fn bloom_keeps_every_trigram()
+    data := b"the quick brown fox jumps over the lazy dog"
+    e := entry(data, 0, data.len())
+    b := bytes.from_list(trailer(e))
+    ix := load(b, 1)
+    assert(ix.ok)
+    assert_eq(ix.nl[0], 0)
+    for ss in slots(data)
+        assert(has(ix, b, 0, ss))
+
+@test fn scan_finds_lines_once()
+    buf := b"alpha beta\nbeta beta\ngamma\n"
+    hits := scan(buf, buf.len(), b"beta", false)
+    assert_eq(hits, [0, 11])
+    assert_eq(line_start(buf, 17), 11)
+    assert_eq(line_end(buf, 17), 20)
+    assert_eq(scan(b"Beta", 4, b"bETA", true), [0])
+    assert_eq(scan(b"Beta", 4, b"bETA", false), [])
+
+@test fn slots_fold_case()
+    assert_eq(slot(65, 66, 67), slot(97, 98, 99))

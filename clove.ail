@@ -7,6 +7,10 @@
 ##     clove.ail t [--json] ARCHIVE                     test: decode every block, check CRCs
 ##     clove.ail read ARCHIVE FILE [--range A:B] [--out PATH]
 ##                                                      bytes A..B of one file, decoding only the blocks it needs
+##     clove.ail grep [--json] [-i] [-a] [--max N] [--file NAME] ARCHIVE TEXT
+##                                                      lines holding TEXT; the trigram index skips blocks that cannot match
+##     clove.ail describe [--json] ARCHIVE              files, kinds, line counts, engines and the index
+##     clove.ail serve                                  MCP server on stdin and stdout: list, describe, read, grep
 ##     clove.ail bench FILE [-m fast|max] [-b BLOCK_KB]          ratio and speed, with a round-trip check
 ##
 ## Blocks are independent: they compress and decode on all cores (`par for`),
@@ -15,6 +19,7 @@
 
 use cm
 use lz
+use search
 
 MAGIC := b"CLV2"
 BATCH := 8
@@ -28,6 +33,10 @@ USAGE := """
       t [--json] ARCHIVE                test every block
       read ARCHIVE FILE [--range A:B] [--out PATH]
                                         part of one file; only the blocks it needs are decoded
+      grep [--json] [-i] [-a] [--max N] [--file NAME] ARCHIVE TEXT
+                                        lines holding TEXT, decoding only blocks the index lets through
+      describe [--json] ARCHIVE         files, kinds, line counts, engines, index size
+      serve                             MCP server on stdin/stdout (tools clove_list, clove_describe, clove_read, clove_grep)
       bench FILE [-m fast|max] [-b BLOCK_KB]   ratio, speed and round-trip check
     """
 
@@ -68,7 +77,7 @@ fn put(mut out List[int], v int, nbytes int)
     for i in 0..nbytes
         out.push(v.shr(8 * i).bit_and(255))
 
-fn get(b bytes, pos int, nbytes int) int ! CloveError
+fn rd(b bytes, pos int, nbytes int) int ! CloveError
     if pos + nbytes > b.len()
         return Bad(why: "truncated at byte {pos}")
     mut v := 0
@@ -156,20 +165,20 @@ fn unpack(
 fn parse_archive(b bytes, path str) Archive ! CloveError
     if b.len() < 16 or b[0..4] != MAGIC
         return Bad(why: "{path} is not a CLV2 archive")
-    nfiles := get(b, 4, 4)?
-    nblk := get(b, 8, 4)?
-    bsize := get(b, 12, 4)?
+    nfiles := rd(b, 4, 4)?
+    nblk := rd(b, 8, 4)?
+    bsize := rd(b, 12, 4)?
     if bsize <= 0
         return Bad(why: "block size 0")
     mut p := 16
     mut files := List[FileEnt]()
     mut total := 0
     for _ in 0..nfiles
-        nlen := get(b, p, 2)?
+        nlen := rd(b, p, 2)?
         name := b[p + 2..p + 2 + nlen].text()
-        size := get(b, p + 2 + nlen, 8)?
-        first := get(b, p + 10 + nlen, 4)?
-        nb := get(b, p + 14 + nlen, 4)?
+        size := rd(b, p + 2 + nlen, 8)?
+        first := rd(b, p + 10 + nlen, 4)?
+        nb := rd(b, p + 14 + nlen, 4)?
         if first != total or nb != nblocks(size, bsize)
             return Bad(why: "{name}: block range")
         files.push(FileEnt(name: name, size: size, first: first, nb: nb))
@@ -183,10 +192,10 @@ fn parse_archive(b bytes, path str) Archive ! CloveError
     mut engines := List[int]()
     mut rel := List[int]()
     for _ in 0..nblk
-        rel.push(get(b, p, 8)?)
-        clens.push(get(b, p + 8, 4)?)
-        crcs.push(get(b, p + 12, 4)?)
-        engines.push(get(b, p + 16, 1)?)
+        rel.push(rd(b, p, 8)?)
+        clens.push(rd(b, p + 8, 4)?)
+        crcs.push(rd(b, p + 12, 4)?)
+        engines.push(rd(b, p + 16, 1)?)
         p += 17
     for i in 0..nblk
         if p + rel[i] + clens[i] > b.len()
@@ -255,6 +264,7 @@ fn cmd_add(archive str, paths List[str], bsize int, engine int) ! CloveError | f
     mut ents := List[FileEnt]()
     mut all := Packed(data: b"", clens: [], crcs: [], engines: [])
     mut total := 0
+    mut foot := List[int]()
     for f in files
         name := stored_name(f)
         if not safe(name)
@@ -266,10 +276,12 @@ fn cmd_add(archive str, paths List[str], bsize int, engine int) ! CloveError | f
         all.crcs.extend(p.crcs)
         all.engines.extend(p.engines)
         fs.append_bytes(tmp, p.data)?
+        foot.extend(search.file_entries(data, bsize))
         total += data.len()
         print("{f}  {data.len()}")
     fs.write_bytes(archive, header_bytes(bsize, ents, all))?
     fs.append_bytes(archive, fs.read_bytes(tmp)?)?
+    fs.append_bytes(archive, to_bytes(search.trailer(foot)))?
     fs.remove(tmp)?
     print("{files.len()} files, {total} -> {fs.metadata(archive)?.size} bytes")
 
@@ -301,10 +313,11 @@ fn packed_of(a Archive, f FileEnt) int
         c += x
     c
 
-fn q(s str) str
-    s.replace("\\", "\\\\").replace("\"", "\\\"")
+## A JSON string literal, quotes included.
+fn js(s str) str
+    Json.Str(s).to_text()
 
-fn cmd_list(archive str, json bool) ! CloveError | fs.IoError
+fn list_json(archive str) str ! CloveError | fs.IoError
     b := fs.read_bytes(archive)?
     a := parse_archive(b, archive)?
     mut size := 0
@@ -312,16 +325,25 @@ fn cmd_list(archive str, json bool) ! CloveError | fs.IoError
     mut items := List[str]()
     for f in a.files
         c := packed_of(a, f)
-        if json
-            items.push("\{\"name\": \"{q(f.name)}\", \"size\": {f.size}, \"packed\": {c}, \"blocks\": {f.nb}}")
-        else
-            print("{f.size:>12} {c:>12}  {f.name}")
+        items.push("\{\"name\": {js(f.name)}, \"size\": {f.size}, \"packed\": {c}, \"blocks\": {f.nb}}")
         size += f.size
         packed += c
+    "\{\"archive\": {js(archive)}, \"block_size\": {a.bsize}, \"files\": [{items.join(", ")}], \"size\": {size}, \"packed\": {packed}}"
+
+fn cmd_list(archive str, json bool) ! CloveError | fs.IoError
     if json
-        print("\{\"archive\": \"{q(archive)}\", \"block_size\": {a.bsize}, \"files\": [{items.join(", ")}], \"size\": {size}, \"packed\": {packed}}")
-    else
-        print("{size:>12} {packed:>12}  {a.files.len()} files")
+        print(list_json(archive)?)
+        return
+    b := fs.read_bytes(archive)?
+    a := parse_archive(b, archive)?
+    mut size := 0
+    mut packed := 0
+    for f in a.files
+        c := packed_of(a, f)
+        print("{f.size:>12} {c:>12}  {f.name}")
+        size += f.size
+        packed += c
+    print("{size:>12} {packed:>12}  {a.files.len()} files")
 
 fn cmd_test(archive str, json bool) ! CloveError | fs.IoError
     b := fs.read_bytes(archive)?
@@ -343,7 +365,7 @@ fn cmd_test(archive str, json bool) ! CloveError | fs.IoError
         print("ok: {a.files.len()} files")
 
 ## Bytes lo..hi of one file; only the blocks that cover them are decoded.
-fn cmd_read(archive str, name str, lo int, hi int, out str) ! CloveError | fs.IoError
+fn read_part(archive str, name str, lo int, hi int) bytes ! CloveError | fs.IoError
     b := fs.read_bytes(archive)?
     a := parse_archive(b, archive)?
     mut found := -1
@@ -357,7 +379,7 @@ fn cmd_read(archive str, name str, lo int, hi int, out str) ! CloveError | fs.Io
     if lo < 0 or lo > end
         return Usage(text: "range {lo}:{end} is outside {name} ({f.size} bytes)")
     if lo == end
-        return
+        return b""
     b0 := lo / a.bsize
     b1 := (end - 1) / a.bsize + 1
     g0 := f.first + b0
@@ -378,11 +400,275 @@ fn cmd_read(archive str, name str, lo int, hi int, out str) ! CloveError | fs.Io
         if got[i].len() != rawlens[i]
             return Bad(why: "{name}: block {b0 + i} is damaged")
         buf.extend(got[i])
-    part := bytes.from_list(buf[lo - b0 * a.bsize..end - b0 * a.bsize])
+    bytes.from_list(buf[lo - b0 * a.bsize..end - b0 * a.bsize])
+
+fn cmd_read(archive str, name str, lo int, hi int, out str) ! CloveError | fs.IoError
+    part := read_part(archive, name, lo, hi)?
     if out == ""
         print(part.text())
     else
         fs.write_bytes(out, part)?
+
+CHUNK := 32
+HITTEXT := 512
+
+struct Hit
+    file str
+    line int
+    offset int
+    text str
+
+struct Found
+    hits List[Hit]
+    truncated bool
+    indexed bool
+    blocks int
+    decoded int
+    skipped int
+
+## Lines of `pat` in the archive's files. With the trigram trailer, only blocks whose filter
+## can hold the text are decoded (plus the next block of a candidate, for a match that
+## crosses the boundary); without it every block is.
+fn run_grep(
+    archive str,
+    pat str,
+    fold bool,
+    binary bool,
+    max int,
+    only str,
+) Found ! CloveError | fs.IoError
+    b := fs.read_bytes(archive)?
+    a := parse_archive(b, archive)?
+    pb := pat.to_bytes()
+    if pb.len() == 0
+        return Usage(text: "grep needs text to look for")
+    if pb.len() > a.bsize
+        return Usage(text: "the text is longer than the block ({a.bsize} bytes)")
+    ix := search.load(b, a.offs.len())
+    mut r := Found(hits: [], truncated: false, indexed: ix.ok, blocks: 0, decoded: 0, skipped: 0)
+    for f in a.files
+        if only != "" and f.name != only
+            continue
+        r.blocks += f.nb
+        mut cands := [j for j in 0..f.nb]
+        mut pre := [0 for _ in 0..f.nb]
+        if ix.ok
+            cands = search.candidates(ix, b, f.first, f.nb, pb, binary)
+            if not binary
+                for j in 0..f.nb
+                    if ix.text[f.first + j] == 0
+                        r.skipped += 1
+            for j in 1..f.nb
+                pre[j] = pre[j - 1] + ix.nl[f.first + j - 1]
+        mut running := 0
+        mut c0 := 0
+        while c0 < cands.len() and not r.truncated
+            c1 := (c0 + CHUNK).min(cands.len())
+            mut need := List[int]()
+            for j in cands[c0..c1]
+                if need.len() == 0 or need[need.len() - 1] < j
+                    need.push(j)
+                if j + 1 < f.nb
+                    need.push(j + 1)
+            mut at := [-1 for _ in 0..f.nb]
+            for t in 0..need.len()
+                at[need[t]] = t
+            rl := [raw_len(f.size, a.bsize, j) for j in need]
+            got := decode(
+                b,
+                [a.offs[f.first + j] for j in need],
+                [a.clens[f.first + j] for j in need],
+                [a.engines[f.first + j] for j in need],
+                [a.crcs[f.first + j] for j in need],
+                rl,
+                0,
+                need.len(),
+            )
+            r.decoded += need.len()
+            for t in 0..need.len()
+                if got[t].len() != rl[t]
+                    return Bad(why: "{f.name}: block {need[t]} is damaged")
+            for j in cands[c0..c1]
+                own := bytes.from_list(got[at[j]])
+                buf := if j + 1 < f.nb then own + bytes.from_list(got[at[j + 1]]) else own
+                before := if ix.ok then pre[j] else running
+                for p in search.scan(buf, own.len(), pb, fold)
+                    if r.hits.len() >= max
+                        r.truncated = true
+                        break
+                    s := search.line_start(buf, p)
+                    e := search.line_end(buf, p).min(s + HITTEXT)
+                    r.hits.push(Hit(
+                        file: f.name,
+                        line: before + search.newlines(buf, s) + 1,
+                        offset: j * a.bsize + s,
+                        text: buf[s..e].text(),
+                    ))
+                running += search.newlines(own, own.len())
+                if r.truncated
+                    break
+            c0 = c1
+        if r.truncated
+            break
+    r
+
+fn grep_json(r Found, archive str, pat str) str
+    items := [
+        "\{\"file\": {js(h.file)}, \"line\": {h.line}, \"offset\": {h.offset}, \"text\": {js(h.text)}}"
+        for h in r.hits
+    ]
+    "\{\"archive\": {js(archive)}, \"pattern\": {js(pat)}, \"hits\": [{items.join(", ")}], \"truncated\": {r.truncated}, \"indexed\": {r.indexed}, \"blocks\": {r.blocks}, \"decoded\": {r.decoded}, \"skipped_binary\": {r.skipped}}"
+
+fn cmd_grep(archive str, pat str, o Opts) ! CloveError | fs.IoError
+    r := run_grep(archive, pat, o.fold, o.binary, o.max, o.only)?
+    if o.json
+        print(grep_json(r, archive, pat))
+        return
+    for h in r.hits
+        print("{h.file}:{h.line}:{h.text}")
+    if r.truncated
+        eprint("clove: stopped at {o.max} lines (--max N for more)")
+
+fn kind_of(ix search.Index, f FileEnt) str
+    if not ix.ok or f.nb == 0
+        return "unknown"
+    mut text := 0
+    for j in 0..f.nb
+        text += ix.text[f.first + j]
+    if text == f.nb
+        return "text"
+    if text == 0
+        return "binary"
+    "mixed"
+
+## One JSON object that tells an agent what is inside before it reads anything.
+fn describe_json(archive str) str ! CloveError | fs.IoError
+    b := fs.read_bytes(archive)?
+    a := parse_archive(b, archive)?
+    ix := search.load(b, a.offs.len())
+    mut items := List[str]()
+    mut size := 0
+    mut packed := 0
+    for f in a.files
+        mut nl := 0
+        mut cm_blocks := 0
+        mut lz_blocks := 0
+        mut stored := 0
+        for j in 0..f.nb
+            if ix.ok
+                nl += ix.nl[f.first + j]
+            match a.engines[f.first + j]
+                0 => stored += 1
+                1 => cm_blocks += 1
+                _ => lz_blocks += 1
+        c := packed_of(a, f)
+        size += f.size
+        packed += c
+        items.push("\{\"name\": {js(f.name)}, \"size\": {f.size}, \"packed\": {c}, \"blocks\": {f.nb}, \"kind\": \"{kind_of(ix, f)}\", \"newlines\": {nl}, \"engines\": \{\"stored\": {stored}, \"cm\": {cm_blocks}, \"lz\": {lz_blocks}}}")
+    mut index_bytes := 0
+    if ix.ok
+        for k in ix.ks
+            index_bytes += 6 + search.pow2(k) / 8
+        index_bytes += 8
+    "\{\"archive\": {js(archive)}, \"block_size\": {a.bsize}, \"files\": [{items.join(", ")}], \"size\": {size}, \"packed\": {packed}, \"blocks\": {a.offs.len()}, \"index\": \{\"trigram\": {ix.ok}, \"bytes\": {index_bytes}}}"
+
+fn cmd_describe(archive str, json bool) ! CloveError | fs.IoError
+    if json
+        print(describe_json(archive)?)
+        return
+    b := fs.read_bytes(archive)?
+    a := parse_archive(b, archive)?
+    ix := search.load(b, a.offs.len())
+    for f in a.files
+        mut nl := 0
+        for j in 0..f.nb
+            if ix.ok
+                nl += ix.nl[f.first + j]
+        print("{f.size:>12} {packed_of(a, f):>12} {kind_of(ix, f):<8} {nl:>9} lines  {f.name}")
+    print("{a.files.len()} files, {a.offs.len()} blocks of {a.bsize} bytes, trigram index: {if ix.ok then "yes" else "no"}")
+
+fn prop(name str, kind str) str
+    "{js(name)}: \{\"type\": {js(kind)}}"
+
+fn tool(name str, desc str, props List[str], required List[str]) str
+    req := [js(r) for r in required]
+    "\{\"name\": {js(name)}, \"description\": {js(desc)}, \"inputSchema\": \{\"type\": \"object\", \"properties\": \{{props.join(", ")}}, \"required\": [{req.join(", ")}]}}"
+
+fn tools_json() str
+    ar := prop("archive", "string")
+    list := tool("clove_list", "List the files in a Clove archive with sizes and block counts.", [ar], ["archive"])
+    desc := tool(
+        "clove_describe",
+        "Describe a Clove archive: each file's kind (text, binary, mixed), newline count, codecs and the trigram index. Reads only the index.",
+        [ar],
+        ["archive"],
+    )
+    read := tool(
+        "clove_read",
+        "Read bytes start..end of one file, decoding only the blocks that hold them. Output is capped at 65536 bytes.",
+        [ar, prop("file", "string"), prop("start", "integer"), prop("end", "integer")],
+        ["archive", "file"],
+    )
+    grep := tool(
+        "clove_grep",
+        "Find lines containing a literal string without extracting the archive; the trigram index skips blocks that cannot match. Returns file, line, byte offset and text.",
+        [ar, prop("pattern", "string"), prop("ignore_case", "boolean"), prop("binary", "boolean"), prop("max", "integer"), prop("file", "string")],
+        ["archive", "pattern"],
+    )
+    "[{[list, desc, read, grep].join(", ")}]"
+
+SERVE_CAP := 65536
+
+fn call_tool(name str, args Json) str ! CloveError | fs.IoError
+    archive := args.text("archive", "")
+    if archive == ""
+        return Usage(text: "{name} needs an archive")
+    match name
+        "clove_list" => list_json(archive)?
+        "clove_describe" => describe_json(archive)?
+        "clove_read" =>
+            lo := (args.get("start")?.as_num() else 0.0).to_int()
+            hi := (args.get("end")?.as_num() else -1.0).to_int()
+            file := args.text("file", "")
+            part := read_part(archive, file, lo, if hi < 0 then lo + SERVE_CAP else hi.min(lo + SERVE_CAP))?
+            part.text()
+        "clove_grep" =>
+            pat := args.text("pattern", "")
+            max := (args.get("max")?.as_num() else 200.0).to_int()
+            r := run_grep(archive, pat, args.flag("ignore_case", false), args.flag("binary", false), max, args.text("file", ""))?
+            grep_json(r, archive, pat)
+        _ => return Usage(text: "unknown tool {name}")
+
+fn reply(id str, body str)
+    print("\{\"jsonrpc\": \"2.0\", \"id\": {id}, {body}}")
+
+## MCP over stdio: one JSON-RPC message per line.
+fn cmd_serve()
+    while true
+        line := io.read_line() else break
+        if line.trim() == ""
+            continue
+        msg := parse_json(line) else err
+            reply("null", "\"error\": \{\"code\": -32700, \"message\": \"parse error\"}")
+            continue
+        mut id := ""
+        if i := msg.get("id")
+            id = i.to_text()
+        method := msg.text("method", "")
+        if id == ""
+            continue
+        match method
+            "initialize" => reply(id, "\"result\": \{\"protocolVersion\": \"2024-11-05\", \"capabilities\": \{\"tools\": \{}}, \"serverInfo\": \{\"name\": \"clove\", \"version\": \"0.1\"}}")
+            "tools/list" => reply(id, "\"result\": \{\"tools\": {tools_json()}}")
+            "tools/call" =>
+                params := msg.get("params") else Json.Obj([])
+                args := params.get("arguments") else Json.Obj([])
+                out := call_tool(params.text("name", ""), args) else err
+                    reply(id, "\"result\": \{\"content\": [\{\"type\": \"text\", \"text\": {js("{err}")}}], \"isError\": true}")
+                    continue
+                reply(id, "\"result\": \{\"content\": [\{\"type\": \"text\", \"text\": {js(out)}}], \"isError\": false}")
+            "ping" => reply(id, "\"result\": \{}")
+            _ => reply(id, "\"error\": \{\"code\": -32601, \"message\": \"method not found\"}")
 
 fn mb_per_s(n int, ms int) str
     if ms <= 0
@@ -425,10 +711,14 @@ struct Opts
     lo int
     hi int
     out str
+    fold bool
+    binary bool
+    max int
+    only str
     words List[str]
 
 fn parse(args List[str]) Opts ! CloveError
-    mut o := Opts(bsize: BLOCK, engine: 2, json: false, lo: 0, hi: -1, out: "", words: [])
+    mut o := Opts(bsize: BLOCK, engine: 2, json: false, lo: 0, hi: -1, out: "", fold: false, binary: false, max: 200, only: "", words: [])
     mut i := 0
     while i < args.len()
         a := args[i]
@@ -450,6 +740,18 @@ fn parse(args List[str]) Opts ! CloveError
             i += 1
         elif a == "--out"
             o.out = word
+            i += 2
+        elif a == "-i"
+            o.fold = true
+            i += 1
+        elif a == "-a"
+            o.binary = true
+            i += 1
+        elif a == "--max"
+            o.max = word.to_int() else return Usage(text: "--max needs a number")
+            i += 2
+        elif a == "--file"
+            o.only = word
             i += 2
         elif a == "--range"
             ends := word.split(":")
@@ -473,7 +775,7 @@ fn need(w List[str], n int, what str) ! CloveError
 
 fn main() !
     args := env.args()
-    if args.len() < 2
+    if args.len() < 1
         print(USAGE)
         return
     o := parse(args[1..])?
@@ -494,6 +796,13 @@ fn main() !
         "read" =>
             need(w, 2, "read needs ARCHIVE and FILE")?
             cmd_read(w[0], w[1], o.lo, o.hi, o.out)?
+        "grep" =>
+            need(w, 2, "grep needs ARCHIVE and TEXT")?
+            cmd_grep(w[0], w[1], o)?
+        "describe" =>
+            need(w, 1, "describe needs ARCHIVE")?
+            cmd_describe(w[0], o.json)?
+        "serve" => cmd_serve()
         "bench" =>
             need(w, 1, "bench needs FILE")?
             cmd_bench(w[0], o.bsize, o.engine)?
