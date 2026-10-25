@@ -969,7 +969,21 @@ fn same_file(a str, b str) bool ! fs.IoError
     assert(flips < index_end)
 
 @test fn unsafe_names_are_refused()
-    for n in ["/etc/passwd", "../x", "a/../../x", "..\\x", "a\\..\\x", "C:x", "C:\\x", "\\\\server\\share", "a//b", "./a", "a/./b", "", "a\u{1}b"]
+    for n in [
+        "/etc/passwd",
+        "../x",
+        "a/../../x",
+        "..\\x",
+        "a\\..\\x",
+        "C:x",
+        "C:\\x",
+        "\\\\server\\share",
+        "a//b",
+        "./a",
+        "a/./b",
+        "",
+        "a\u{1}b",
+    ]
         assert(not safe(n))
     for n in ["a", "a/b.txt", "src/deep/er/exact.bin", "..a", "a..", "na\u{ef}ve.txt"]
         assert(safe(n))
