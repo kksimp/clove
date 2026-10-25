@@ -59,6 +59,12 @@ clove grep -i "$tmp/edge2.clove" "STRADDLE-WORD" | grep -q "straddle-word" || re
 # binary blocks are skipped unless -a
 clove grep --json "$a" "zzzqqq-not-there" | grep -q '"skipped_binary": [1-9]' || red "binary blocks should be counted as skipped"
 
+# one long line holding the text in two blocks counts once, and the next line is number 2
+{ printf 'ab'; head -c 4200 /dev/zero | tr '\0' 'y'; printf 'ab\nab\n'; } > "$tmp/dup.txt"
+clove a -b 4 "$tmp/dup.clove" "$tmp/dup.txt" >/dev/null || red "add dup"
+got=$(clove grep "$tmp/dup.clove" "ab" | cut -d: -f2 | tr '\n' ' ')
+[ "$got" = "1 2 " ] || red "a line that spans blocks must be one hit: want [1 2 ] got [$got]"
+
 # serve: initialize, list the tools, grep through a tool call
 resp=$(printf '%s\n' \
   '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}' \

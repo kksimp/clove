@@ -170,9 +170,11 @@ fn same(buf bytes, i int, pat bytes, fold bool) bool
 pub fn scan(buf bytes, own int, pat bytes, fold bool) List[int]
     mut hits := List[int]()
     m := pat.len()
+    p0 := if fold then lower(pat[0].to_int()) else pat[0].to_int()
     mut i := 0
     while i < own and i + m <= buf.len()
-        if same(buf, i, pat, fold)
+        c := if fold then lower(buf[i].to_int()) else buf[i].to_int()
+        if c == p0 and same(buf, i, pat, fold)
             hits.push(i)
             mut j := i
             while j < buf.len() and buf[j] != 10
@@ -194,9 +196,10 @@ pub fn line_end(buf bytes, p int) int
         j += 1
     j
 
-pub fn newlines(buf bytes, upto int) int
+## The newlines in buf[lo..hi].
+pub fn newlines(buf bytes, lo int, hi int) int
     mut n := 0
-    for i in 0..upto
+    for i in lo..hi
         if buf[i] == 10
             n += 1
     n
