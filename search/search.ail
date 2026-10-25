@@ -3,12 +3,14 @@
 ##
 ## Trailer: for each block in archive order
 ##     u32 newline count | u8 text flag (no NUL byte) | u8 k | 2^k bits of Bloom filter (k 8..15)
-## then u32 trailer length (this word and the magic included) | "CLX1".
+## then u32 trailer length (this word and the magic included) | "CLX2".
+## A binary block (one with a NUL byte) has k 0 and no filter: its trigrams fill any filter,
+## so it would cost 4 KB and rule nothing out; `grep -a` scans it.
 ## A trigram is folded to lower case ASCII, so one filter answers both `grep` and `grep -i`.
 ## A block's filter also holds the trigrams that start in its last two bytes, so a match
 ## that crosses into the next block of the same file is found from the first block.
 
-MAGIC := b"CLX1"
+MAGIC := b"CLX2"
 MAXK := 15
 MINK := 8
 
@@ -64,6 +66,12 @@ pub fn entry(data bytes, s int, e int) List[int]
         if i + 2 < data.len()
             p := slot(c, data[i + 1].to_int(), data[i + 2].to_int())
             bm[p.shr(3)] = bm[p.shr(3)].bit_or(pow2(p.bit_and(7)))
+    mut out := List[int]()
+    le(mut out, nl, 4)
+    out.push(text)
+    if text == 0
+        out.push(0)
+        return out
     mut k := MAXK
     while k > MINK
         half := fold_half(bm)
@@ -71,9 +79,6 @@ pub fn entry(data bytes, s int, e int) List[int]
             break
         bm = half
         k -= 1
-    mut out := List[int]()
-    le(mut out, nl, 4)
-    out.push(text)
     out.push(k)
     out.extend(bm)
     out
@@ -82,7 +87,7 @@ pub fn entry(data bytes, s int, e int) List[int]
 pub fn trailer(entries List[int]) List[int]
     mut out := entries
     le(mut out, entries.len() + 8, 4)
-    out.extend([67, 76, 88, 49])
+    out.extend([67, 76, 88, 50])
     out
 
 fn word(b bytes, pos int) int
@@ -108,19 +113,22 @@ pub fn load(b bytes, nblk int) Index
         if p + 6 > end
             return none_found
         k := b[p + 5].to_int()
-        if k < MINK or k > MAXK or p + 6 + pow2(k) / 8 > end
+        size := if k == 0 then 0 else pow2(k) / 8
+        if (k != 0 and k < MINK) or k > MAXK or p + 6 + size > end
             return none_found
         ix.nl.push(word(b, p))
         ix.text.push(b[p + 4].to_int())
         ix.ks.push(k)
         ix.offs.push(p + 6)
-        p += 6 + pow2(k) / 8
+        p += 6 + size
     if p != end
         return none_found
     ix
 
-## Does block `g`'s filter hold the slot s?
+## Does block `g`'s filter hold the slot s? A block with no filter holds every slot.
 fn has(ix Index, b bytes, g int, s int) bool
+    if ix.ks[g] == 0
+        return true
     q := s.bit_and(pow2(ix.ks[g]) - 1)
     b[ix.offs[g] + q.shr(3)].to_int().shr(q.bit_and(7)).bit_and(1) == 1
 
@@ -202,6 +210,23 @@ pub fn newlines(buf bytes, upto int) int
     assert_eq(ix.nl[0], 0)
     for ss in slots(data)
         assert(has(ix, b, 0, ss))
+
+@test fn binary_blocks_have_no_filter()
+    bin := b"text then a NUL \x00 and more text"
+    mut raw := bin.to_list()
+    raw.extend(b"plain text block".to_list())
+    data := bytes.from_list(raw)
+    mut e := entry(data, 0, bin.len())
+    assert_eq(e.len(), 6)
+    e.extend(entry(data, bin.len(), data.len()))
+    b := bytes.from_list([x.to_u8() for x in trailer(e)])
+    ix := load(b, 2)
+    assert(ix.ok)
+    assert_eq(ix.ks[0], 0)
+    assert_eq(ix.text, [0, 1])
+    assert(has(ix, b, 0, slot(122, 122, 122)))
+    assert_eq(candidates(ix, b, 0, 1, b"zzz", true), [0])
+    assert_eq(candidates(ix, b, 0, 1, b"zzz", false), [])
 
 @test fn scan_finds_lines_once()
     buf := b"alpha beta\nbeta beta\ngamma\n"
