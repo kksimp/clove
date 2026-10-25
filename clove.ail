@@ -241,6 +241,13 @@ fn safe(name str) bool
             return false
     true
 
+## Names are stored relative, as 7-Zip does: a leading "/" or "./" is dropped.
+fn stored_name(path str) str
+    mut s := path
+    while s.starts_with("/") or s.starts_with("./")
+        s = s.slice(if s.starts_with("/") then 1 else 2, s.len())
+    s
+
 fn cmd_add(archive str, paths List[str], bsize int, engine int) ! CloveError | fs.IoError
     files := collect(paths)?
     tmp := "{archive}.tmp"
@@ -249,11 +256,12 @@ fn cmd_add(archive str, paths List[str], bsize int, engine int) ! CloveError | f
     mut all := Packed(data: b"", clens: [], crcs: [], engines: [])
     mut total := 0
     for f in files
-        if not safe(f)
+        name := stored_name(f)
+        if not safe(name)
             return Usage(text: "refusing the name {f}")
         data := fs.read_bytes(f)?
         p := pack(data, bsize, engine)
-        ents.push(FileEnt(name: f, size: data.len(), first: all.clens.len(), nb: p.clens.len()))
+        ents.push(FileEnt(name: name, size: data.len(), first: all.clens.len(), nb: p.clens.len()))
         all.clens.extend(p.clens)
         all.crcs.extend(p.crcs)
         all.engines.extend(p.engines)

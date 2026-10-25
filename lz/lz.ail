@@ -1,6 +1,7 @@
-## Clove's fast engine (engine 2): LZ77 with hash chains and one-step lazy
-## matching, then an adaptive binary range coder with context-mixed literals,
-## a repeat-last-distance match, and bit-tree length and distance models.
+## Clove's fast engine (engine 2): LZ77 with hash chains and lazy matching,
+## then an adaptive binary range coder. The model follows the LZMA family: a
+## 12-state machine, four repeat distances and a one-byte repeat, contexts by
+## position mod 4, literals by the previous byte, matched literals after a match.
 ## Decoding does no searching, so it runs far faster than the CM engine.
 
 MINLEN := 4
@@ -9,14 +10,18 @@ HSIZE := 262144
 TOP := 16777216
 
 IS_MATCH := 0
-IS_REP := 3
-LIT := 8
-LEN_MATCH := 12296
-LEN_REP := 12570
-SLOT := 12844
-SPEC := 13100
-ALIGN := 14124
-PROBS := 14140
+IS_REP := 48
+IS_G0 := 60
+IS_G1 := 72
+IS_G2 := 84
+IS_LONG := 96
+LIT := 144
+LEN_MATCH := 12432
+LEN_REP := 12754
+SLOT := 13076
+SPEC := 13332
+ALIGN := 14356
+PROBS := 14372
 
 struct Enc
     out List[int]
@@ -96,18 +101,19 @@ fn Enc.lit(mut self, prevb int, v int, mb int, matched bool)
         m = m * 2 + b
         i -= 1
 
-fn Enc.mlen(mut self, base int, l int)
+## Length l - 2 (0..271) with a context of the position mod 4.
+fn Enc.mlen(mut self, base int, l int, ps int)
     if l < 8
         bit(base, 0)
-        tree(base + 2, 3, l)
+        tree(base + 2 + ps * 8, 3, l)
     elif l < 16
         bit(base, 1)
         bit(base + 1, 0)
-        tree(base + 10, 3, l - 8)
+        tree(base + 34 + ps * 8, 3, l - 8)
     else
         bit(base, 1)
         bit(base + 1, 1)
-        tree(base + 18, 8, l - 16)
+        tree(base + 66, 8, l - 16)
 
 fn slot_of(d int) int
     if d < 4
@@ -132,6 +138,37 @@ fn Enc.dist(mut self, l int, d int)
             rtree(ALIGN, 4, e.bit_and(15))
         else
             rtree(SPEC + s * 16, n, e)
+
+fn after_lit(s int) int
+    if s < 4
+        return 0
+    if s < 10
+        return s - 3
+    s - 6
+
+fn after_match(s int) int
+    if s < 7 then 7 else 10
+
+fn after_rep(s int) int
+    if s < 7 then 8 else 11
+
+fn after_short(s int) int
+    if s < 7 then 9 else 11
+
+## Moves repeat distance `i` to the front.
+fn rep_front(mut reps List[int], i int)
+    d := reps[i]
+    mut k := i
+    while k > 0
+        reps[k] = reps[k - 1]
+        k -= 1
+    reps[0] = d
+
+fn rep_push(mut reps List[int], d int)
+    reps[3] = reps[2]
+    reps[2] = reps[1]
+    reps[1] = reps[0]
+    reps[0] = d
 
 fn hash4(d List[int], pos int) int
     v := d[pos] + d[pos + 1].shl(8) + d[pos + 2].shl(16) + d[pos + 3].shl(24)
@@ -186,7 +223,7 @@ fn depth_of(level int) int
         return 128
     256
 
-## Compresses `d` (bytes as ints) to a self-contained range-coded block.
+## Compresses `d` (bytes as ints) to a self-contained range-coded block.## Compresses `d` (bytes as ints) to a self-contained range-coded block.
 pub fn compress(d List[int], level int) List[int]
     n := d.len()
     depth := depth_of(level)
@@ -194,9 +231,9 @@ pub fn compress(d List[int], level int) List[int]
     mut e := Enc(out: [], lo: 0, rng: 4294967295, cache: 0, csize: 1, p: [1024 for _ in 0..PROBS])
     mut head := [0 for _ in 0..HSIZE]
     mut prev := [0 for _ in 0..n]
+    mut reps := [0, 0, 0, 0]
     mut pos := 0
     mut state := 0
-    mut rep0 := 0
     mut have := false
     mut l1 := 0
     mut d1 := 0
@@ -206,18 +243,36 @@ pub fn compress(d List[int], level int) List[int]
             l1 = t.0
             d1 = t.1
         have = false
+        ps := pos.bit_and(3)
+        limit := MAXLEN.min(n - pos)
+        mut ri := -1
         mut rl := 0
-        if pos > rep0
-            rl = match_len(d, pos - rep0 - 1, pos, MAXLEN.min(n - pos))
+        for k in 0..4
+            if pos > reps[k]
+                l := match_len(d, pos - reps[k] - 1, pos, limit)
+                if l > rl
+                    rl = l
+                    ri = k
         ins(mut head, mut prev, d, pos, n)
-        if rl >= MINLEN and rl + 1 >= l1
-            e.bit(IS_MATCH + state, 1)
+        if rl >= 2 and rl + 1 >= l1
+            e.bit(IS_MATCH + state * 4 + ps, 1)
             e.bit(IS_REP + state, 1)
-            e.mlen(LEN_REP, rl - MINLEN)
+            if ri == 0
+                e.bit(IS_G0 + state, 0)
+                e.bit(IS_LONG + state * 4 + ps, 1)
+            else
+                e.bit(IS_G0 + state, 1)
+                if ri == 1
+                    e.bit(IS_G1 + state, 0)
+                else
+                    e.bit(IS_G1 + state, 1)
+                    e.bit(IS_G2 + state, ri - 2)
+                rep_front(mut reps, ri)
+            e.mlen(LEN_REP, rl - 2, ps)
             for k in 1..rl
                 ins(mut head, mut prev, d, pos + k, n)
             pos += rl
-            state = 2
+            state = after_rep(state)
             continue
         if l1 >= MINLEN
             if lazy and l1 < 32 and pos + 1 < n
@@ -227,22 +282,30 @@ pub fn compress(d List[int], level int) List[int]
                     d1 = t2.1
                     have = true
             if not have
-                e.bit(IS_MATCH + state, 1)
+                e.bit(IS_MATCH + state * 4 + ps, 1)
                 e.bit(IS_REP + state, 0)
-                e.mlen(LEN_MATCH, l1 - MINLEN)
-                e.dist(l1 - MINLEN, d1)
+                e.mlen(LEN_MATCH, l1 - 2, ps)
+                e.dist(l1 - 2, d1)
                 for k in 1..l1
                     ins(mut head, mut prev, d, pos + k, n)
                 pos += l1
-                rep0 = d1
-                state = 1
+                rep_push(mut reps, d1)
+                state = after_match(state)
                 continue
+        mb := if pos > reps[0] then d[pos - reps[0] - 1] else -1
+        if mb == d[pos]
+            e.bit(IS_MATCH + state * 4 + ps, 1)
+            e.bit(IS_REP + state, 1)
+            e.bit(IS_G0 + state, 0)
+            e.bit(IS_LONG + state * 4 + ps, 0)
+            pos += 1
+            state = after_short(state)
+            continue
+        e.bit(IS_MATCH + state * 4 + ps, 0)
         prevb := if pos > 0 then d[pos - 1] else 0
-        mb := if state != 0 then d[pos - rep0 - 1] else 0
-        e.bit(IS_MATCH + state, 0)
-        e.lit(prevb, d[pos], mb, state != 0)
+        e.lit(prevb, d[pos], mb, state >= 7)
         pos += 1
-        state = 0
+        state = after_lit(state)
     for _ in 0..5
         e.shift_low()
     e.out
@@ -321,12 +384,12 @@ fn Dec.lit(mut self, prevb int, mb int, matched bool) int
         i -= 1
     m - 256
 
-fn Dec.mlen(mut self, base int) int
+fn Dec.mlen(mut self, base int, ps int) int
     if bit(base) == 0
-        return tree(base + 2, 3)
+        return tree(base + 2 + ps * 8, 3)
     if bit(base + 1) == 0
-        return 8 + tree(base + 10, 3)
-    16 + tree(base + 18, 8)
+        return 8 + tree(base + 34 + ps * 8, 3)
+    16 + tree(base + 66, 8)
 
 fn Dec.dist(mut self, l int) int
     ctx := if l > 3 then 3 else l
@@ -350,33 +413,42 @@ pub fn decompress(src List[int], n int) List[int]
     mut dc := Dec(src: src, pos: 5, code: code, rng: 4294967295, p: [1024 for _ in 0..PROBS])
     mut out := List[int]()
     mut state := 0
-    mut rep0 := 0
+    mut reps := [0, 0, 0, 0]
     while out.len() < n
         pos := out.len()
-        if dc.bit(IS_MATCH + state) == 0
+        ps := pos.bit_and(3)
+        if dc.bit(IS_MATCH + state * 4 + ps) == 0
             prevb := if pos > 0 then out[pos - 1] else 0
-            if state != 0 and pos <= rep0
-                return []
-            mb := if state != 0 then out[pos - rep0 - 1] else 0
-            out.push(dc.lit(prevb, mb, state != 0))
-            state = 0
-        else
-            mut l := 0
-            if dc.bit(IS_REP + state) == 1
-                l = dc.mlen(LEN_REP)
-                state = 2
+            mb := if pos > reps[0] then out[pos - reps[0] - 1] else -1
+            out.push(dc.lit(prevb, mb, state >= 7))
+            state = after_lit(state)
+            continue
+        mut l := 0
+        if dc.bit(IS_REP + state) == 1
+            if dc.bit(IS_G0 + state) == 0
+                if dc.bit(IS_LONG + state * 4 + ps) == 0
+                    if pos <= reps[0]
+                        return []
+                    out.push(out[pos - reps[0] - 1])
+                    state = after_short(state)
+                    continue
+            elif dc.bit(IS_G1 + state) == 0
+                rep_front(mut reps, 1)
             else
-                l = dc.mlen(LEN_MATCH)
-                rep0 = dc.dist(l)
-                state = 1
-            l += MINLEN
-            at := pos - rep0 - 1
-            if at < 0 or pos + l > n
-                return []
-            for k in 0..l
-                out.push(out[at + k])
+                rep_front(mut reps, 2 + dc.bit(IS_G2 + state))
+            l = dc.mlen(LEN_REP, ps) + 2
+            state = after_rep(state)
+        else
+            l = dc.mlen(LEN_MATCH, ps)
+            rep_push(mut reps, dc.dist(l))
+            l += 2
+            state = after_match(state)
+        at := pos - reps[0] - 1
+        if at < 0 or pos + l > n
+            return []
+        for k in 0..l
+            out.push(out[at + k])
     out
-
 @test fn roundtrips_text()
     mut d := List[int]()
     for i in 0..3000
@@ -390,3 +462,14 @@ pub fn decompress(src List[int], n int) List[int]
     for n in 0..9
         d := [7 for _ in 0..n]
         assert_eq(decompress(compress(d, 5), n), d)
+
+
+@test fn roundtrips_repeat_distances()
+    words := [[104, 101, 108, 108, 111], [119, 111, 114, 108, 100], [97, 105, 108]]
+    mut d := List[int]()
+    for i in 0..2000
+        d.extend(words[(i * 7 + i / 3) % 3])
+        d.push(32 + i % 2)
+        d.push((i * 31) % 256)
+    for level in [1, 5]
+        assert_eq(decompress(compress(d, level), d.len()), d)
