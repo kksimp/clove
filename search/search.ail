@@ -51,7 +51,7 @@ fn fold_half(bm List[int]) List[int]
     [bm[j].bit_or(bm[j + h]) for j in 0..h]
 
 ## The trailer entry of the block data[s..e]: counts and Bloom filter, shrunk while sparse.
-fn entry(data bytes, s int, e int) List[int]
+pub fn entry(data bytes, s int, e int) List[int]
     mut bm := [0 for _ in 0..(pow2(MAXK) / 8)]
     mut nl := 0
     mut text := 1
@@ -77,17 +77,6 @@ fn entry(data bytes, s int, e int) List[int]
     out.push(k)
     out.extend(bm)
     out
-
-## The trailer entries of one file's blocks, one block per core.
-pub fn file_entries(data bytes, bsize int) List[int]
-    nb := (data.len() + bsize - 1) / bsize
-    mut parts := [List[int]() for _ in 0..nb]
-    par for i in 0..nb
-        parts[i] = entry(data, i * bsize, (i * bsize + bsize).min(data.len()))
-    mut all := List[int]()
-    for p in parts
-        all.extend(p)
-    all
 
 ## The bytes appended after the last block, given every file's entries joined.
 pub fn trailer(entries List[int]) List[int]

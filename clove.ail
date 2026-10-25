@@ -257,6 +257,17 @@ fn stored_name(path str) str
         s = s.slice(if s.starts_with("/") then 1 else 2, s.len())
     s
 
+## The trailer entries of one file's blocks, one block per core.
+fn index_file(data bytes, bsize int) List[int]
+    nb := nblocks(data.len(), bsize)
+    mut parts := [List[int]() for _ in 0..nb]
+    par for i in 0..nb
+        parts[i] = search.entry(data, i * bsize, (i * bsize + bsize).min(data.len()))
+    mut all := List[int]()
+    for p in parts
+        all.extend(p)
+    all
+
 fn cmd_add(archive str, paths List[str], bsize int, engine int) ! CloveError | fs.IoError
     files := collect(paths)?
     tmp := "{archive}.tmp"
@@ -276,7 +287,7 @@ fn cmd_add(archive str, paths List[str], bsize int, engine int) ! CloveError | f
         all.crcs.extend(p.crcs)
         all.engines.extend(p.engines)
         fs.append_bytes(tmp, p.data)?
-        foot.extend(search.file_entries(data, bsize))
+        foot.extend(index_file(data, bsize))
         total += data.len()
         print("{f}  {data.len()}")
     fs.write_bytes(archive, header_bytes(bsize, ents, all))?
