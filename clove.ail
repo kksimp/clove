@@ -18,18 +18,20 @@
 ## Format: README.md. Errors carry a rule ID (`clove.format`, `clove.usage`).
 
 use cm
+use exe
 use lz
 use search
 
 MAGIC := b"CLV2"
 BATCH := 8
-BLOCK := 131072
+BLOCK_FAST := 1048576
+BLOCK_MAX := 4194304
 MAX_BLOCK := 1073741824
 MAX_SIZE := 281474976710656
 
 USAGE := """
     usage: clove COMMAND ...
-      a [-m fast|max] [-b BLOCK_KB] ARCHIVE PATH...   add (fast: LZ engine, max: context mixing; block 128 KB)
+      a [-m fast|max] [-b BLOCK_KB] ARCHIVE PATH...   add (fast: LZ, 1 MB blocks; max: context mixing, 4 MB blocks)
       x ARCHIVE [DIR]                   extract into DIR (default .)
       l [--json] ARCHIVE                list
       t [--json] ARCHIVE                test every block
@@ -94,8 +96,11 @@ fn raw_len(size int, bsize int, i int) int
     bsize.min(size - i * bsize)
 
 ## Compresses `data` block by block (a block that does not shrink is stored).
+## The engine byte: the codec in the low 4 bits (0 stored, 1 cm, 2 lz) and the
+## executable filter in the next 2 (0 none, 1 x86-64, 2 ARM64; never on stored blocks).
 fn pack(data bytes, bsize int, engine int) Packed
     nb := nblocks(data.len(), bsize)
+    kind := exe.detect(data)
     mut parts := [List[u8]() for _ in 0..nb]
     mut crcs := [0 for _ in 0..nb]
     mut all := b""
@@ -107,13 +112,14 @@ fn pack(data bytes, bsize int, engine int) Packed
             raw := data[s..(s + bsize).min(data.len())]
             crcs[i] = hash.crc32(raw)
             blk := raw.to_list()
-            c := if engine == 1 then cm.compress(blk) else lz.compress(blk, 5)
+            src := if kind == 0 then blk else exe.filter(blk, kind, true)
+            c := if engine == 1 then cm.compress(src) else lz.compress(src, 5)
             parts[i] = if c.len() < blk.len() then c else blk
         for i in first..last
             all = all + bytes.from_list(parts[i])
         first = last
     clens := [q.len() for q in parts]
-    engines := [if clens[i] == raw_len(data.len(), bsize, i) then 0 else engine for i in 0..nb]
+    engines := [if clens[i] == raw_len(data.len(), bsize, i) then 0 else engine + kind.shl(4) for i in 0..nb]
     Packed(data: all, clens: clens, crcs: crcs, engines: engines)
 
 ## Decodes blocks `first..last` (positions in the arrays) on all cores; a block that
@@ -131,10 +137,12 @@ fn decode(
     mut out := [List[u8]() for _ in 0..clens.len()]
     par for i in first..last
         comp := data[offs[i]..offs[i] + clens[i]].to_list()
-        raw := match engines[i]
+        kind := engines[i].shr(4)
+        dec := match engines[i].bit_and(15)
             0 => comp
             1 => cm.decompress(comp, rawlens[i])
             _ => lz.decompress(comp, rawlens[i])
+        raw := if kind == 0 then dec else exe.filter(dec, kind, false)
         ok := raw.len() == rawlens[i] and hash.crc32(bytes.from_list(raw)) == crcs[i]
         out[i] = if ok then raw else List[u8]()
     out
@@ -212,7 +220,8 @@ fn parse_archive(b bytes, path str) Archive ! CloveError
             raw := raw_len(f.size, bsize, k)
             if rel != next
                 return Bad(why: "{f.name}: block {k} is not where the index says")
-            if eng > 2 or clen < 1 or clen > raw or (eng == 0) != (clen == raw)
+            codec := eng.bit_and(15)
+            if codec > 2 or eng.shr(4) > 2 or (codec == 0 and eng != 0) or clen < 1 or clen > raw or (codec == 0) != (clen == raw)
                 return Bad(why: "{f.name}: block {k} has engine {eng} and length {clen} for {raw} bytes")
             if dstart + rel + clen > b.len()
                 return Bad(why: "{f.name}: block {k} runs past the end of the archive")
@@ -598,7 +607,7 @@ fn describe_json(archive str) str ! CloveError | fs.IoError
         for j in 0..f.nb
             if ix.ok
                 nl += ix.nl[f.first + j]
-            match a.engines[f.first + j]
+            match a.engines[f.first + j].bit_and(15)
                 0 => stored += 1
                 1 => cm_blocks += 1
                 _ => lz_blocks += 1
@@ -793,7 +802,7 @@ struct Opts
 
 fn parse(args List[str]) Opts ! CloveError
     mut o := Opts(
-        bsize: BLOCK,
+        bsize: 0,
         engine: 2,
         json: false,
         lo: 0,
@@ -851,6 +860,8 @@ fn parse(args List[str]) Opts ! CloveError
         else
             o.words.push(a)
             i += 1
+    if o.bsize == 0
+        o.bsize = if o.engine == 1 then BLOCK_MAX else BLOCK_FAST
     if o.bsize < 4096 or o.bsize > MAX_BLOCK
         return Usage(text: "the block is 4 KB to 1 GB")
     o
@@ -989,3 +1000,23 @@ fn same_file(a str, b str) bool ! fs.IoError
         assert(safe(n))
     assert_eq(stored_name("/abs/path.txt"), "abs/path.txt")
     assert_eq(stored_name(".\\win\\path.txt"), "win/path.txt")
+
+@test fn executables_round_trip_through_the_filter()
+    root := "{TEST_DIR}/exe"
+    fs.make_dir(root)?
+    mut prog := b"\x7fELF".to_list()
+    for _ in 0..14
+        prog.push((0).to_u8())
+    prog.extend([(62).to_u8(), (0).to_u8()])
+    for k in 0..3000
+        rel := 50000 - k * 5
+        prog.extend([(232).to_u8(), rel.bit_and(255).to_u8(), rel.shr(8).bit_and(255).to_u8(), (0).to_u8(), (0).to_u8()])
+        prog.extend(test_bytes(3, k).to_list())
+    fs.write_bytes("{root}/prog", bytes.from_list(prog))?
+    for engine in [2, 1]
+        arc := "{root}/p{engine}.clove"
+        cmd_add(arc, ["{root}/prog"], 4096, engine)?
+        a := parse_archive(fs.read_bytes(arc)?, arc)?
+        assert_eq(a.engines[0].shr(4), 1)
+        cmd_extract(arc, "{root}/out{engine}")?
+        assert(same_file("{root}/prog", "{root}/out{engine}/{root}/prog")?)
