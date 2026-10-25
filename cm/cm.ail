@@ -98,6 +98,7 @@ struct Model
     tbits int
     o0 List[int]
     idx List[int]
+    bkt List[int]
     hv List[int]
     st List[int]
     wa List[int]
@@ -136,6 +137,7 @@ fn new_model(n int) Model
         tbits: tbits,
         o0: [INIT for _ in 0..256],
         idx: [0 for _ in 0..NORD],
+        bkt: [0 for _ in 0..NORD],
         hv: [0 for _ in 0..NORD],
         st: [0 for _ in 0..NIN],
         wa: [16000 for _ in 0..NIN * 256],
@@ -179,11 +181,18 @@ fn Model.set_slot(mut self, j int, e int)
     old := t[w].shr(sh).bit_and(MASK31)
     t[w] = t[w] - old.shl(sh) + e.shl(sh)
 
-## Slots of the context models for the next bit.
+## Slots of the context models for the next bit. Each context hashes once per
+## nibble to a bucket of 16 slots (8 ints, one cache line); the bits of the
+## nibble so far pick the slot, so a byte costs two cache misses per context
+## instead of eight.
 fn Model.set_idx(mut self)
-    smask := (1).shl(tbits) - 1
+    if bitpos == 0 or bitpos == 4
+        bmask := (1).shl(tbits - 4) - 1
+        for i in 0..NORD
+            bkt[i] = ((hv[i] + c0 * 40503) * 2654435761).shr(20).bit_and(bmask).shl(4) + i.shl(tbits)
+    nib := if bitpos < 4 then c0 else (1).shl(bitpos - 4) + c0.bit_and((1).shl(bitpos - 4) - 1)
     for i in 0..NORD
-        idx[i] = ((hv[i] + c0 * 40503) * 2654435761).shr(20).bit_and(smask) + i.shl(tbits)
+        idx[i] = bkt[i] + nib
 
 ## SSE: interpolate the curve of context `cx` (stage 1 or 2) at p's logit.
 fn Model.apm(mut self, stage int, cx int, p int) int
