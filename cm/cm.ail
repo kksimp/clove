@@ -173,7 +173,7 @@ fn new_model(n int) Model
     m
 
 ## Slot j of the hashed tables: two 31-bit slots share one int.
-fn Model.slot(self, j int) int
+fn Model.slot(mut self, j int) int
     t[j.shr(1)].shr(31 * j.bit_and(1)).bit_and(MASK31)
 
 fn Model.set_slot(mut self, j int, e int)
@@ -189,7 +189,7 @@ fn Model.set_idx(mut self)
         idx[i] = ((hv[i] + c0 * 40503) * 2654435761).shr(20).bit_and(smask) + i.shl(tbits)
 
 ## SSE: interpolate the curve of context `cx` (stage 1 or 2) at p's logit.
-fn Model.apm(self, stage int, cx int, p int) int
+fn Model.apm(mut self, stage int, cx int, p int) int
     s := sq[p] + 2048
     j := cx * 33 + s.shr(7)
     w := s.bit_and(127)
@@ -197,7 +197,7 @@ fn Model.apm(self, stage int, cx int, p int) int
         return (a1[j] * (128 - w) + a1[j + 1] * w).shr(11)
     (a2[j] * (128 - w) + a2[j + 1] * w).shr(11)
 
-fn Model.adapt(self, e int, y int, limit int) int
+fn Model.adapt(mut self, e int, y int, limit int) int
     n := e.bit_and(1023)
     p := e.shr(10)
     p2 := p + ((y.shl(21) - p) * dt[n]) / 65536
