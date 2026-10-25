@@ -4,7 +4,8 @@
 # Corpus: FILES (default 64) generated log files of MB_EACH (default 1) MB, with one rare error
 # line planted in one file. Archives at 1 MB (fast default) and 128 KB blocks. For each query:
 # hits, seconds, blocks decoded of total, and bytes decompressed. Rare, medium, common and
-# short (under three bytes, so no index help) queries cover best and worst cases.
+# short (under three bytes, so no index help) queries cover best and worst cases. Prints
+# MISMATCH and exits 1 when clove grep and grep(1) disagree on a hit count.
 set -eu
 cd "$(git rev-parse --show-toplevel)"
 ail_dir=$(cd "${AIL:-../ail}" && pwd)
@@ -25,6 +26,8 @@ secs() { echo "($2 - $1) / 1000000000" | bc -l; }
 tar -C "$tmp" -cf "$tmp/logs.tar" logs
 zstd -q -19 -T0 "$tmp/logs.tar" -o "$tmp/logs.tar.zst" 2>/dev/null || true
 queries=("E7731 disk quota" "items/42 ms=17" "level=warn" "ms")
+fail=0
+got=()
 echo "corpus: $nf files, $total bytes"
 echo
 echo "| archive | query | hits | seconds | blocks decoded | bytes decompressed |"
@@ -34,21 +37,25 @@ for kb in 1024 128; do
   "$tmp/clove" a -m fast -b $kb "$a" "$c" >/dev/null
   ix=$("$tmp/clove" describe --json "$a" | grep -o '"index": {[^}]*}' | grep -o '"bytes": [0-9]*' | grep -o '[0-9]*$')
   echo "| clove -b $kb: $(wc -c <"$a" | tr -d ' ') B, index $ix B | | | | | |"
-  for q in "${queries[@]}"; do
+  for i in "${!queries[@]}"; do
+    q=${queries[$i]}
     s=$(ns)
     "$tmp/clove" grep --json --max 100000000 "$a" "$q" >"$tmp/out.json"
     e=$(ns)
     hits=$(grep -o '"line": ' "$tmp/out.json" | wc -l | tr -d ' ')
+    got[$i]=$hits
     blk=$(grep -o '"blocks": [0-9]*' "$tmp/out.json" | tail -1 | grep -o '[0-9]*$')
     dec=$(grep -o '"decoded": [0-9]*' "$tmp/out.json" | tail -1 | grep -o '[0-9]*$')
     printf '| clove -b %s | `%s` | %s | %.2f | %s / %s | ~%s |\n' "$kb" "$q" "$hits" "$(secs $s $e)" "$dec" "$blk" "$(( dec * kb * 1024 < total ? dec * kb * 1024 : total ))"
   done
-  for q in "${queries[@]}"; do
+  for i in "${!queries[@]}"; do
+    q=${queries[$i]}
     s=$(ns)
     "$tmp/clove" x "$a" "$tmp/x" >/dev/null
     hits=$(grep -r -n -F -- "$q" "$tmp/x" | wc -l | tr -d ' ')
     rm -rf "$tmp/x"
     e=$(ns)
+    [ "$hits" = "${got[$i]}" ] || { echo "MISMATCH -b $kb \`$q\`: clove ${got[$i]}, grep $hits"; fail=1; }
     printf '| clove x + grep | `%s` | %s | %.2f | all | %s |\n' "$q" "$hits" "$(secs $s $e)" "$total"
   done
 done
@@ -60,3 +67,4 @@ if [ -f "$tmp/logs.tar.zst" ]; then
     printf '| zstd -dc tar + grep | `%s` | %s | %.2f | all | %s |\n' "$q" "$hits" "$(secs $s $e)" "$total"
   done
 fi
+exit $fail
