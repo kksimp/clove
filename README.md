@@ -33,15 +33,18 @@ data: the packed blocks, in order
 Blocks (default 1 MB for fast, 4 MB for max) are independent, so `a`, `x`, `t` and `read` work one block per
 core with `par for`, and `read FILE --range A:B` decodes only the blocks it needs.
 
-## Trigram trailer (`CLX1`, `search/search.ail`)
+## Trigram trailer (`CLX2`, `search/search.ail`)
 
 Optional, after the last block; readers that do not know it ignore it, and `grep` falls back
 to scanning every block when it is missing.
 
 ```
-per block: u32 newline count | u8 text flag (no NUL byte) | u8 k (8..15) | 2^k bits Bloom filter
-then:      u32 trailer length (this word and the magic included) | "CLX1"
+per block: u32 newline count | u8 text flag (no NUL byte) | u8 k (0, or 8..15) | 2^k bits Bloom filter
+then:      u32 trailer length (this word and the magic included) | "CLX2"
 ```
+
+A binary block (one holding a NUL byte) has k 0 and no filter bytes: its trigrams would fill any
+filter, so it would cost 4 KB and rule nothing out. `grep -a` scans such blocks.
 
 A trigram is folded to ASCII lower case, hashed to 15 bits, and set in the block's filter, which is
 folded in half while under 30% full. A block's filter also holds the trigrams that start in its
