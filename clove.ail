@@ -412,7 +412,9 @@ fn parse(args List[str]) Opts ! CloveError
             if ends.len() != 2
                 return Usage(text: "--range needs A:B")
             o.lo = ends[0].to_int() else return Usage(text: "--range needs numbers")
-            o.hi = if ends[1] == "" then -1 else ends[1].to_int() else return Usage(text: "--range needs numbers")
+            o.hi = -1
+            if ends[1] != ""
+                o.hi = ends[1].to_int() else return Usage(text: "--range needs numbers")
             i += 2
         else
             o.words.push(a)
