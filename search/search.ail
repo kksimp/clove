@@ -13,11 +13,11 @@ MAXK := 15
 MINK := 8
 
 pub struct Index
-    ok bool
-    nl List[int]
-    text List[int]
-    ks List[int]
-    offs List[int]
+    pub ok bool
+    pub nl List[int]
+    pub text List[int]
+    pub ks List[int]
+    pub offs List[int]
 
 pub fn pow2(k int) int
     v := 1
@@ -207,7 +207,7 @@ pub fn newlines(buf bytes, upto int) int
 @test fn bloom_keeps_every_trigram()
     data := b"the quick brown fox jumps over the lazy dog"
     e := entry(data, 0, data.len())
-    b := bytes.from_list(trailer(e))
+    b := bytes.from_list([x.to_u8() for x in trailer(e)])
     ix := load(b, 1)
     assert(ix.ok)
     assert_eq(ix.nl[0], 0)
@@ -217,7 +217,7 @@ pub fn newlines(buf bytes, upto int) int
 @test fn scan_finds_lines_once()
     buf := b"alpha beta\nbeta beta\ngamma\n"
     hits := scan(buf, buf.len(), b"beta", false)
-    assert_eq(hits, [0, 11])
+    assert_eq(hits, [6, 11])
     assert_eq(line_start(buf, 17), 11)
     assert_eq(line_end(buf, 17), 20)
     assert_eq(scan(b"Beta", 4, b"bETA", true), [0])

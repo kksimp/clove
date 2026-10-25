@@ -527,7 +527,7 @@ fn cmd_grep(archive str, pat str, o Opts) ! CloveError | fs.IoError
     for h in r.hits
         print("{h.file}:{h.line}:{h.text}")
     if r.truncated
-        eprint("clove: stopped at {o.max} lines (--max N for more)")
+        io.eprint("clove: stopped at {o.max} lines (--max N for more)")
 
 fn kind_of(ix search.Index, f FileEnt) str
     if not ix.ok or f.nb == 0
