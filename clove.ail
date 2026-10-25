@@ -508,12 +508,13 @@ fn run_grep(
                         r.truncated = true
                         break
                     s := search.line_start(buf, p)
-                    e := search.line_end(buf, p).min(s + HITTEXT)
+                    w := (p - HITTEXT / 4).max(s)
+                    e := search.line_end(buf, p).min(w + HITTEXT)
                     r.hits.push(Hit(
                         file: f.name,
                         line: before + search.newlines(buf, s) + 1,
-                        offset: j * a.bsize + s,
-                        text: buf[s..e].text(),
+                        offset: j * a.bsize + p,
+                        text: buf[w..e].text(),
                     ))
                 running += search.newlines(own, own.len())
                 if r.truncated

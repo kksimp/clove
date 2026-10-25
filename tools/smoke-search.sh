@@ -36,7 +36,8 @@ a="$tmp/t4.clove"
 want=$(grep -c -F "needle-that-is-absent" "$tmp/long.txt")
 clove grep --json "$a" "needle-that-is-absent" | grep -q '"decoded": 0' || red "an absent text should decode no block"
 clove describe --json "$a" | grep -q '"kind": "binary"' || red "random.bin should be binary"
-clove read "$a" "${tmp#/}/long.txt" --range 100:200 | cmp -s - <(head -c 200 "$tmp/long.txt" | tail -c 100) || red "read --range"
+clove read "$a" "${tmp#/}/long.txt" --range 100:200 --out "$tmp/part" >/dev/null
+head -c 200 "$tmp/long.txt" | tail -c 100 | cmp -s - "$tmp/part" || red "read --range"
 
 # a match that straddles a block boundary: 4 KB blocks, the word split at 4096
 { head -c 4090 /dev/zero | tr '\0' 'x'; printf 'straddle-word'; head -c 5000 /dev/zero | tr '\0' 'y'; } > "$tmp/edge.txt"

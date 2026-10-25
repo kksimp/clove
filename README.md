@@ -48,7 +48,7 @@ folded in half while under 30% full. A block's filter also holds the trigrams th
 last two bytes, so a candidate block is one whose filter holds the first trigram of the text, and
 every trigram in its own filter or its successor's; the successor is decoded too, so matches that
 cross a boundary are found. `grep` treats the text as a literal (at most one block long), reports
-the first match per line with file, line, byte offset and text, skips blocks with a NUL byte
+the first match per line with file, line, the match's byte offset and the text around it (at most 512 bytes), skips blocks with a NUL byte
 unless `-a`, and stops at `--max` lines (default 200). Line numbers come from the newline counts,
 so no earlier block is decoded.
 
