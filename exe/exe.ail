@@ -55,7 +55,10 @@ fn x86(d List[u8], enc bool) List[u8]
         if (op == 232 or op == 233) and i + 5 <= n
             top := d[i + 4].to_int()
             if top == 0 or top == 255
-                v := d[i + 1].to_int() + d[i + 2].to_int().shl(8) + d[i + 3].to_int().shl(16) + (if top == 255 then 16777216 else 0)
+                v := d[i + 1].to_int()
+                    + d[i + 2].to_int().shl(8)
+                    + d[i + 3].to_int().shl(16)
+                    + (if top == 255 then 16777216 else 0)
                 p := i + 5
                 w := (if enc then v + p else v - p).bit_and(33554431)
                 out.push(w.bit_and(255).to_u8())
@@ -73,7 +76,10 @@ fn arm64(d List[u8], enc bool) List[u8]
     mut out := List[u8]()
     mut i := 0
     while i + 4 <= n
-        w := d[i].to_int() + d[i + 1].to_int().shl(8) + d[i + 2].to_int().shl(16) + d[i + 3].to_int().shl(24)
+        w := d[i].to_int()
+            + d[i + 1].to_int().shl(8)
+            + d[i + 2].to_int().shl(16)
+            + d[i + 3].to_int().shl(24)
         if w.shr(26) == 37
             pc := i / 4
             imm := w.bit_and(67108863)
@@ -110,7 +116,13 @@ fn sample(n int, seed int) List[u8]
         mut d := sample(5000, seed)
         # plant real-looking calls and branches
         for k in 0..200
-            d.extend([(232).to_u8(), (k * 7).bit_and(255).to_u8(), (16).to_u8(), (0).to_u8(), (0).to_u8()])
+            d.extend([
+                (232).to_u8(),
+                (k * 7).bit_and(255).to_u8(),
+                (16).to_u8(),
+                (0).to_u8(),
+                (0).to_u8(),
+            ])
             d.extend([(0).to_u8(), (16).to_u8(), (0).to_u8(), (148).to_u8()])
         for kind in [X86, ARM64]
             assert_eq(filter(filter(d, kind, true), kind, false), d)
@@ -120,7 +132,13 @@ fn sample(n int, seed int) List[u8]
     for k in 0..50
         # call to absolute 4096 from position k*5: displacement 4096 - (k*5 + 5)
         rel := 4096 - (k * 5 + 5)
-        d.extend([(232).to_u8(), rel.bit_and(255).to_u8(), rel.shr(8).bit_and(255).to_u8(), (0).to_u8(), (0).to_u8()])
+        d.extend([
+            (232).to_u8(),
+            rel.bit_and(255).to_u8(),
+            rel.shr(8).bit_and(255).to_u8(),
+            (0).to_u8(),
+            (0).to_u8(),
+        ])
     f := filter(d, X86, true)
     assert_eq(f[1..5], f[6..10])
 
