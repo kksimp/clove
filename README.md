@@ -26,11 +26,11 @@ any block of any file.
 ```
 "CLV2" | u32 file count | u32 block count | u32 block size
 per file:  u16 name length | name (UTF-8, relative, no "..") | u64 size | u32 first block | u32 block count
-per block: u64 offset into the data | u32 packed length | u32 CRC32 of the raw block | u8 engine (0 stored, 1 cm, 2 lz)
+per block: u64 offset into the data | u32 packed length | u32 CRC32 of the raw block | u8 engine: low 4 bits codec (0 stored, 1 cm, 2 lz), next 2 bits executable filter (0 none, 1 x86-64, 2 ARM64)
 data: the packed blocks, in order
 ```
 
-Blocks (default 128 KB) are independent, so `a`, `x`, `t` and `read` work one block per
+Blocks (default 1 MB for fast, 4 MB for max) are independent, so `a`, `x`, `t` and `read` work one block per
 core with `par for`, and `read FILE --range A:B` decodes only the blocks it needs.
 
 ## Trigram trailer (`CLX1`, `search/search.ail`)
