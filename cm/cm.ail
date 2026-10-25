@@ -90,11 +90,8 @@ fn bits_for(n int, lo int, hi int) int
 
 ## The SSE curve of context `cx`: 33 points over the logit range.
 fn apm_init(nctx int) List[int]
-    mut a := List[int]()
-    for _c in 0..nctx
-        for j in 0..33
-            a.push(squash((j - 16) * 128) * 16)
-    a
+    curve := [squash((j - 16) * 128) * 16 for j in 0..33]
+    [curve[k % 33] for k in 0..nctx * 33]
 
 struct Model
     t List[int]
