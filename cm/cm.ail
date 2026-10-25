@@ -76,14 +76,8 @@ fn stretch_table() List[int]
 fn delta_table() List[int]
     [131072 / (2 * n + 3) for n in 0..1024]
 
-## One slot: a 21-bit probability over a 10-bit hit count; the count sets the
-## learning rate (fast at first, then settling at 1/limit).
-fn adapt(e int, y int, limit int, dt List[int]) int
-    n := e.bit_and(1023)
-    p := e.shr(10)
-    p2 := p + ((y.shl(21) - p) * dt[n]) / 65536
-    n2 := if n < limit then n + 1 else n
-    p2.shl(10) + n2
+## Table slots hold a 21-bit probability over a 10-bit hit count; the count sets
+## the learning rate (fast at first, then settling at 1/limit). See Model.adapt.
 
 fn fold(x int) int
     x.bit_xor(x.shr(32)).bit_and(268435455)
@@ -194,11 +188,21 @@ fn Model.set_idx(mut self)
     for i in 0..NORD
         idx[i] = ((hv[i] + c0 * 40503) * 2654435761).shr(20).bit_and(smask) + i.shl(tbits)
 
-fn Model.apm(self, a List[int], cx int, p int) int
+## SSE: interpolate the curve of context `cx` (stage 1 or 2) at p's logit.
+fn Model.apm(self, stage int, cx int, p int) int
     s := sq[p] + 2048
     j := cx * 33 + s.shr(7)
     w := s.bit_and(127)
-    (a[j] * (128 - w) + a[j + 1] * w).shr(11)
+    if stage == 1
+        return (a1[j] * (128 - w) + a1[j + 1] * w).shr(11)
+    (a2[j] * (128 - w) + a2[j + 1] * w).shr(11)
+
+fn Model.adapt(self, e int, y int, limit int) int
+    n := e.bit_and(1023)
+    p := e.shr(10)
+    p2 := p + ((y.shl(21) - p) * dt[n]) / 65536
+    n2 := if n < limit then n + 1 else n
+    p2.shl(10) + n2
 
 ## The probability (12 bits) that the next bit is 1.
 fn Model.predict(mut self) int
@@ -236,8 +240,8 @@ fn Model.predict(mut self) int
     pmix = squash((dota + dotb) / 2).max(1).min(4095)
     i1 = c0
     i2 = c0 + c4.bit_and(255).shl(8)
-    p1 := apm(a1, i1, pmix)
-    p2 := apm(a2, i2, pmix)
+    p1 := apm(1, i1, pmix)
+    p2 := apm(2, i2, pmix)
     pr = ((pmix + p1 + 2 * p2) / 4).max(1).min(4095)
     pr
 
@@ -255,11 +259,11 @@ fn Model.update(mut self, y int)
     a1[j1] += (g - a1[j1]) / 128
     j2 := i2 * 33 + near
     a2[j2] += (g - a2[j2]) / 128
-    o0[c0] = adapt(o0[c0], y, LIMIT, dt)
+    o0[c0] = adapt(o0[c0], y, LIMIT)
     for i in 0..NORD
-        set_slot(idx[i], adapt(slot(idx[i]), y, LIMIT, dt))
+        set_slot(idx[i], adapt(slot(idx[i]), y, LIMIT))
     if mctx >= 0
-        msm[mctx] = adapt(msm[mctx], y, 1023, dt)
+        msm[mctx] = adapt(msm[mctx], y, 1023)
     c0 = c0 * 2 + y
     bitpos += 1
     if bitpos == 8
