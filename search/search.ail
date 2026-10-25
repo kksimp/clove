@@ -97,7 +97,10 @@ pub fn trailer(entries List[int]) List[int]
     out
 
 fn word(b bytes, pos int) int
-    b[pos].to_int() + b[pos + 1].to_int().shl(8) + b[pos + 2].to_int().shl(16) + b[pos + 3].to_int().shl(24)
+    b[pos].to_int()
+        + b[pos + 1].to_int().shl(8)
+        + b[pos + 2].to_int().shl(16)
+        + b[pos + 3].to_int().shl(24)
 
 ## Reads the trailer of an archive with `nblk` blocks; `ok` is false when there is none
 ## or it does not fit, and the caller then scans every block.

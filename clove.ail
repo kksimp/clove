@@ -596,7 +596,12 @@ fn tool(name str, desc str, props List[str], required List[str]) str
 
 fn tools_json() str
     ar := prop("archive", "string")
-    list := tool("clove_list", "List the files in a Clove archive with sizes and block counts.", [ar], ["archive"])
+    list := tool(
+        "clove_list",
+        "List the files in a Clove archive with sizes and block counts.",
+        [ar],
+        ["archive"],
+    )
     desc := tool(
         "clove_describe",
         "Describe a Clove archive: each file's kind (text, binary, mixed), newline count, codecs and the trigram index. Reads only the index.",
@@ -612,7 +617,14 @@ fn tools_json() str
     grep := tool(
         "clove_grep",
         "Find lines containing a literal string without extracting the archive; the trigram index skips blocks that cannot match. Returns file, line, byte offset and text.",
-        [ar, prop("pattern", "string"), prop("ignore_case", "boolean"), prop("binary", "boolean"), prop("max", "integer"), prop("file", "string")],
+        [
+            ar,
+            prop("pattern", "string"),
+            prop("ignore_case", "boolean"),
+            prop("binary", "boolean"),
+            prop("max", "integer"),
+            prop("file", "string"),
+        ],
         ["archive", "pattern"],
     )
     "[{[list, desc, read, grep].join(", ")}]"
@@ -630,12 +642,24 @@ fn call_tool(name str, args Json) str ! CloveError | fs.IoError
             lo := (args.get("start")?.as_num() else 0.0).to_int()
             hi := (args.get("end")?.as_num() else -1.0).to_int()
             file := args.text("file", "")
-            part := read_part(archive, file, lo, if hi < 0 then lo + SERVE_CAP else hi.min(lo + SERVE_CAP))?
+            part := read_part(
+                archive,
+                file,
+                lo,
+                if hi < 0 then lo + SERVE_CAP else hi.min(lo + SERVE_CAP),
+            )?
             part.text()
         "clove_grep" =>
             pat := args.text("pattern", "")
             max := (args.get("max")?.as_num() else 200.0).to_int()
-            r := run_grep(archive, pat, args.flag("ignore_case", false), args.flag("binary", false), max, args.text("file", ""))?
+            r := run_grep(
+                archive,
+                pat,
+                args.flag("ignore_case", false),
+                args.flag("binary", false),
+                max,
+                args.text("file", ""),
+            )?
             grep_json(r, archive, pat)
         _ => return Usage(text: "unknown tool {name}")
 
@@ -658,15 +682,24 @@ fn cmd_serve()
         if id == ""
             continue
         match method
-            "initialize" => reply(id, "\"result\": \{\"protocolVersion\": \"2024-11-05\", \"capabilities\": \{\"tools\": \{}}, \"serverInfo\": \{\"name\": \"clove\", \"version\": \"0.1\"}}")
+            "initialize" => reply(
+                id,
+                "\"result\": \{\"protocolVersion\": \"2024-11-05\", \"capabilities\": \{\"tools\": \{}}, \"serverInfo\": \{\"name\": \"clove\", \"version\": \"0.1\"}}",
+            )
             "tools/list" => reply(id, "\"result\": \{\"tools\": {tools_json()}}")
             "tools/call" =>
                 params := msg.get("params") else Json.Obj([])
                 args := params.get("arguments") else Json.Obj([])
                 out := call_tool(params.text("name", ""), args) else err
-                    reply(id, "\"result\": \{\"content\": [\{\"type\": \"text\", \"text\": {js("{err}")}}], \"isError\": true}")
+                    reply(
+                        id,
+                        "\"result\": \{\"content\": [\{\"type\": \"text\", \"text\": {js("{err}")}}], \"isError\": true}",
+                    )
                     continue
-                reply(id, "\"result\": \{\"content\": [\{\"type\": \"text\", \"text\": {js(out)}}], \"isError\": false}")
+                reply(
+                    id,
+                    "\"result\": \{\"content\": [\{\"type\": \"text\", \"text\": {js(out)}}], \"isError\": false}",
+                )
             "ping" => reply(id, "\"result\": \{}")
             _ => reply(id, "\"error\": \{\"code\": -32601, \"message\": \"method not found\"}")
 
@@ -718,7 +751,19 @@ struct Opts
     words List[str]
 
 fn parse(args List[str]) Opts ! CloveError
-    mut o := Opts(bsize: BLOCK, engine: 2, json: false, lo: 0, hi: -1, out: "", fold: false, binary: false, max: 200, only: "", words: [])
+    mut o := Opts(
+        bsize: BLOCK,
+        engine: 2,
+        json: false,
+        lo: 0,
+        hi: -1,
+        out: "",
+        fold: false,
+        binary: false,
+        max: 200,
+        only: "",
+        words: [],
+    )
     mut i := 0
     while i < args.len()
         a := args[i]
