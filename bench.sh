@@ -16,8 +16,11 @@ t() { # name, command writing the compressed file to $tmp/out
   printf '%-10s %12d bytes  ratio %.3f  %6d ms\n' "$name" "$(wc -c <"$tmp/out")" \
     "$(echo "$size / $(wc -c <"$tmp/out")" | bc -l)" $(((e - s) / 1000000))
 }
-echo "== tools (single file, their own defaults) =="
-name=gzip-6;  command -v gzip >/dev/null && t sh -c "gzip -6 -c '$f' >$tmp/out"
-name=xz-6;    command -v xz   >/dev/null && t sh -c "xz -6 -T0 -c '$f' >$tmp/out"
-name=zstd-9;  command -v zstd >/dev/null && t sh -c "zstd -9 -T0 -q -c '$f' >$tmp/out"
-name=7z;      command -v 7z   >/dev/null && t sh -c "rm -f $tmp/out; 7z a -bd -y $tmp/out.7z '$f' && mv $tmp/out.7z $tmp/out"
+echo "== tools (single file) =="
+name=gzip-9;   command -v gzip >/dev/null && t sh -c "gzip -9 -c '$f' >$tmp/out"
+name=zstd-19;  command -v zstd >/dev/null && t sh -c "zstd -19 -T0 -q -c '$f' >$tmp/out"
+name=xz-6;     command -v xz   >/dev/null && t sh -c "xz -6 -T0 -c '$f' >$tmp/out"
+name=xz-9e;    command -v xz   >/dev/null && t sh -c "xz -9e -T0 -c '$f' >$tmp/out"
+for mx in 5 9; do
+  name=7z-mx$mx; command -v 7z >/dev/null && t sh -c "rm -f $tmp/o.7z; 7z a -bd -y -mx$mx $tmp/o.7z '$f' && mv $tmp/o.7z $tmp/out"
+done
