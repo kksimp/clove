@@ -66,7 +66,7 @@ so no earlier block is decoded.
 - **Lines.** A line ends at `\n`. One hit per line; `line` counts from 1 and comes from the newline counts,
   `offset` is the match's byte offset in the file. Lines longer than a block are cut at the block
   and its successor, and the text shown is at most 512 bytes around the match.
-- **Report.** `--json` gives `blocks` (total), `decoded` and `indexed`; `tools/bench-search.sh`
+- **Report.** `--json` gives `blocks` (total), `decoded` and `indexed`; `tools/bench-grep.sh`
   turns them into a table against extract + grep, with the index size.
 
 `serve` speaks MCP (JSON-RPC, one message per line) with tools `clove_list`, `clove_describe`,
