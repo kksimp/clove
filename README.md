@@ -55,6 +55,20 @@ the first match per line with file, line, the match's byte offset and the text a
 unless `-a`, and stops at `--max` lines (default 200). Line numbers come from the newline counts,
 so no earlier block is decoded.
 
+### Search semantics
+
+- **Literal bytes.** The text is matched byte for byte, so UTF-8 works as typed (`café` finds `café`);
+  there is no regex, no Unicode normalisation and no word matching. At most one block long.
+- **`-i` folds ASCII only** (`A-Z` to `a-z`), in the filter and in the match. `É` does not match `é`.
+- **Under three bytes** no trigram exists, so every text block is a candidate and is scanned.
+- **Binary data.** A block holding a NUL byte is skipped unless `-a`; `--json` reports the count as
+  `skipped_binary`. Text in UTF-16 or other NUL-bearing encodings therefore needs `-a`.
+- **Lines.** A line ends at `\n`. One hit per line; `line` counts from 1 and comes from the newline counts,
+  `offset` is the match's byte offset in the file. Lines longer than a block are cut at the block
+  and its successor, and the text shown is at most 512 bytes around the match.
+- **Report.** `--json` gives `blocks` (total), `decoded` and `indexed`; `tools/bench-search.sh`
+  turns them into a table against extract + grep, with the index size.
+
 `serve` speaks MCP (JSON-RPC, one message per line) with tools `clove_list`, `clove_describe`,
 `clove_read` and `clove_grep`; tool errors carry the same `clove.usage` and `clove.format` rules.
 
