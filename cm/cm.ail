@@ -261,7 +261,10 @@ fn Model.update(mut self, y int)
     a2[j2] += (g - a2[j2]) / 128
     o0[c0] = adapt(o0[c0], y, LIMIT)
     for i in 0..NORD
-        set_slot(idx[i], adapt(slot(idx[i]), y, LIMIT))
+        j := idx[i]
+        old := slot(j)
+        upd := adapt(old, y, LIMIT)
+        set_slot(j, upd)
     if mctx >= 0
         msm[mctx] = adapt(msm[mctx], y, 1023)
     c0 = c0 * 2 + y
