@@ -814,7 +814,7 @@ fn parse(args List[str]) Opts ! CloveError
         return Usage(text: "the block is at least 4 KB")
     o
 
-fn need(w List[str], n int, what str) ! CloveError
+fn require(w List[str], n int, what str) ! CloveError
     if w.len() < n
         return Usage(text: what)
 
@@ -827,28 +827,28 @@ fn main() !
     w := o.words
     match args[0]
         "a" =>
-            need(w, 2, "a needs ARCHIVE and PATH...")?
+            require(w, 2, "a needs ARCHIVE and PATH...")?
             cmd_add(w[0], w[1..], o.bsize, o.engine)?
         "x" =>
-            need(w, 1, "x needs ARCHIVE")?
+            require(w, 1, "x needs ARCHIVE")?
             cmd_extract(w[0], if w.len() > 1 then w[1] else ".")?
         "l" =>
-            need(w, 1, "l needs ARCHIVE")?
+            require(w, 1, "l needs ARCHIVE")?
             cmd_list(w[0], o.json)?
         "t" =>
-            need(w, 1, "t needs ARCHIVE")?
+            require(w, 1, "t needs ARCHIVE")?
             cmd_test(w[0], o.json)?
         "read" =>
-            need(w, 2, "read needs ARCHIVE and FILE")?
+            require(w, 2, "read needs ARCHIVE and FILE")?
             cmd_read(w[0], w[1], o.lo, o.hi, o.out)?
         "grep" =>
-            need(w, 2, "grep needs ARCHIVE and TEXT")?
+            require(w, 2, "grep needs ARCHIVE and TEXT")?
             cmd_grep(w[0], w[1], o)?
         "describe" =>
-            need(w, 1, "describe needs ARCHIVE")?
+            require(w, 1, "describe needs ARCHIVE")?
             cmd_describe(w[0], o.json)?
         "serve" => cmd_serve()
         "bench" =>
-            need(w, 1, "bench needs FILE")?
+            require(w, 1, "bench needs FILE")?
             cmd_bench(w[0], o.bsize, o.engine)?
         _ => print(USAGE)
