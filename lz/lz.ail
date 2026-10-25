@@ -171,7 +171,10 @@ fn rep_push(mut reps List[int], d int)
     reps[0] = d
 
 fn hash4(d List[u8], pos int) int
-    v := d[pos].to_int() + d[pos + 1].to_int().shl(8) + d[pos + 2].to_int().shl(16) + d[pos + 3].to_int().shl(24)
+    v := d[pos].to_int()
+        + d[pos + 1].to_int().shl(8)
+        + d[pos + 2].to_int().shl(16)
+        + d[pos + 3].to_int().shl(24)
     (v * 789008181).shr(20).bit_and(262143)
 
 fn ins(mut head List[int], mut prev List[int], d List[u8], pos int, n int)
@@ -409,7 +412,12 @@ fn Dec.dist(mut self, l int) int
 pub fn decompress(src List[u8], n int) List[u8]
     if src.len() < 5
         return []
-    code := src[1].to_int().shl(24).bit_or(src[2].to_int().shl(16)).bit_or(src[3].to_int().shl(8)).bit_or(src[4].to_int())
+    code := src[1]
+        .to_int()
+        .shl(24)
+        .bit_or(src[2].to_int().shl(16))
+        .bit_or(src[3].to_int().shl(8))
+        .bit_or(src[4].to_int())
     mut dc := Dec(src: src, pos: 5, code: code, rng: 4294967295, p: [1024 for _ in 0..PROBS])
     mut out := List[u8]()
     mut state := 0
@@ -465,7 +473,11 @@ pub fn decompress(src List[u8], n int) List[u8]
         assert_eq(decompress(compress(d, 5), n), d)
 
 @test fn roundtrips_repeat_distances()
-    words := ["hello".to_bytes().to_list(), "world".to_bytes().to_list(), "ail".to_bytes().to_list()]
+    words := [
+        "hello".to_bytes().to_list(),
+        "world".to_bytes().to_list(),
+        "ail".to_bytes().to_list(),
+    ]
     mut d := List[u8]()
     for i in 0..2000
         d.extend(words[(i * 7 + i / 3) % 3])
