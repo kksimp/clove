@@ -1,0 +1,392 @@
+## Clove's fast engine (engine 2): LZ77 with hash chains and one-step lazy
+## matching, then an adaptive binary range coder with context-mixed literals,
+## a repeat-last-distance match, and bit-tree length and distance models.
+## Decoding does no searching, so it runs far faster than the CM engine.
+
+MINLEN := 4
+MAXLEN := 273
+HSIZE := 262144
+TOP := 16777216
+
+IS_MATCH := 0
+IS_REP := 3
+LIT := 8
+LEN_MATCH := 12296
+LEN_REP := 12570
+SLOT := 12844
+SPEC := 13100
+ALIGN := 14124
+PROBS := 14140
+
+struct Enc
+    out List[int]
+    lo int
+    rng int
+    cache int
+    csize int
+    p List[int]
+
+fn Enc.shift_low(mut self)
+    if lo < 4278190080 or lo >= 4294967296
+        carry := lo.shr(32)
+        out.push((cache + carry).bit_and(255))
+        csize -= 1
+        while csize > 0
+            out.push((255 + carry).bit_and(255))
+            csize -= 1
+        cache = lo.shr(24).bit_and(255)
+    csize += 1
+    lo = lo.bit_and(16777215).shl(8)
+
+fn Enc.bit(mut self, i int, b int)
+    pr := p[i]
+    bound := rng.shr(11) * pr
+    if b == 0
+        rng = bound
+        p[i] = pr + (2048 - pr).shr(5)
+    else
+        lo += bound
+        rng -= bound
+        p[i] = pr - pr.shr(5)
+    while rng < TOP
+        rng = rng.shl(8)
+        shift_low()
+
+fn Enc.direct(mut self, v int, nbits int)
+    mut i := nbits - 1
+    while i >= 0
+        rng = rng.shr(1)
+        if v.shr(i).bit_and(1) == 1
+            lo += rng
+        while rng < TOP
+            rng = rng.shl(8)
+            shift_low()
+        i -= 1
+
+fn Enc.tree(mut self, base int, nbits int, v int)
+    mut m := 1
+    mut i := nbits - 1
+    while i >= 0
+        b := v.shr(i).bit_and(1)
+        bit(base + m, b)
+        m = m * 2 + b
+        i -= 1
+
+fn Enc.rtree(mut self, base int, nbits int, v int)
+    mut m := 1
+    for i in 0..nbits
+        b := v.shr(i).bit_and(1)
+        bit(base + m, b)
+        m = m * 2 + b
+
+fn Enc.lit(mut self, prevb int, v int, mb int, matched bool)
+    base := LIT + prevb.shr(4) * 768
+    mut m := 1
+    mut mt := matched
+    mut i := 7
+    while i >= 0
+        b := v.shr(i).bit_and(1)
+        if mt
+            mbit := mb.shr(i).bit_and(1)
+            bit(base + 256 + mbit * 256 + m, b)
+            if mbit != b
+                mt = false
+        else
+            bit(base + m, b)
+        m = m * 2 + b
+        i -= 1
+
+fn Enc.mlen(mut self, base int, l int)
+    if l < 8
+        bit(base, 0)
+        tree(base + 2, 3, l)
+    elif l < 16
+        bit(base, 1)
+        bit(base + 1, 0)
+        tree(base + 10, 3, l - 8)
+    else
+        bit(base, 1)
+        bit(base + 1, 1)
+        tree(base + 18, 8, l - 16)
+
+fn slot_of(d int) int
+    if d < 4
+        return d
+    mut n := 0
+    mut t := d
+    while t > 1
+        t = t.shr(1)
+        n += 1
+    2 * n + d.shr(n - 1).bit_and(1)
+
+fn Enc.dist(mut self, l int, d int)
+    s := slot_of(d)
+    ctx := if l > 3 then 3 else l
+    tree(SLOT + ctx * 64, 6, s)
+    if s >= 4
+        n := s.shr(1) - 1
+        base := (2 + s.bit_and(1)).shl(n)
+        e := d - base
+        if n > 4
+            direct(e.shr(4), n - 4)
+            rtree(ALIGN, 4, e.bit_and(15))
+        else
+            rtree(SPEC + s * 16, n, e)
+
+fn hash4(d List[int], pos int) int
+    v := d[pos] + d[pos + 1].shl(8) + d[pos + 2].shl(16) + d[pos + 3].shl(24)
+    (v * 789008181).shr(20).bit_and(262143)
+
+fn ins(mut head List[int], mut prev List[int], d List[int], pos int, n int)
+    if pos + MINLEN <= n
+        h := hash4(d, pos)
+        prev[pos] = head[h]
+        head[h] = pos + 1
+
+fn match_len(d List[int], a int, b int, limit int) int
+    mut k := 0
+    while k < limit and d[a + k] == d[b + k]
+        k += 1
+    k
+
+## The longest earlier match for `pos`: (length, distance - 1), length 0 if none.
+fn find(d List[int], prev List[int], head List[int], pos int, n int, depth int)(int, int)
+    if pos + MINLEN > n
+        return (0, 0)
+    limit := MAXLEN.min(n - pos)
+    mut best := 0
+    mut bd := 0
+    mut cand := head[hash4(d, pos)]
+    mut tries := depth
+    while cand > 0 and tries > 0
+        c := cand - 1
+        if d[c + best] == d[pos + best]
+            l := match_len(d, c, pos, limit)
+            if l > best
+                best = l
+                bd = pos - c - 1
+                if l >= limit
+                    break
+        cand = prev[c]
+        tries -= 1
+    (best, bd)
+
+fn depth_of(level int) int
+    if level <= 1
+        return 4
+    if level == 2
+        return 8
+    if level == 3
+        return 16
+    if level == 4
+        return 32
+    if level == 5
+        return 64
+    if level == 6
+        return 128
+    256
+
+## Compresses `d` (bytes as ints) to a self-contained range-coded block.
+pub fn compress(d List[int], level int) List[int]
+    n := d.len()
+    depth := depth_of(level)
+    lazy := level >= 3
+    mut e := Enc(out: [], lo: 0, rng: 4294967295, cache: 0, csize: 1, p: [1024 for _ in 0..PROBS])
+    mut head := [0 for _ in 0..HSIZE]
+    mut prev := [0 for _ in 0..n]
+    mut pos := 0
+    mut state := 0
+    mut rep0 := 0
+    mut have := false
+    mut l1 := 0
+    mut d1 := 0
+    while pos < n
+        if not have
+            t := find(d, prev, head, pos, n, depth)
+            l1 = t.0
+            d1 = t.1
+        have = false
+        mut rl := 0
+        if pos > rep0
+            rl = match_len(d, pos - rep0 - 1, pos, MAXLEN.min(n - pos))
+        ins(mut head, mut prev, d, pos, n)
+        if rl >= MINLEN and rl + 1 >= l1
+            e.bit(IS_MATCH + state, 1)
+            e.bit(IS_REP + state, 1)
+            e.mlen(LEN_REP, rl - MINLEN)
+            for k in 1..rl
+                ins(mut head, mut prev, d, pos + k, n)
+            pos += rl
+            state = 2
+            continue
+        if l1 >= MINLEN
+            if lazy and l1 < 32 and pos + 1 < n
+                t2 := find(d, prev, head, pos + 1, n, depth)
+                if t2.0 > l1 + 1
+                    l1 = t2.0
+                    d1 = t2.1
+                    have = true
+            if not have
+                e.bit(IS_MATCH + state, 1)
+                e.bit(IS_REP + state, 0)
+                e.mlen(LEN_MATCH, l1 - MINLEN)
+                e.dist(l1 - MINLEN, d1)
+                for k in 1..l1
+                    ins(mut head, mut prev, d, pos + k, n)
+                pos += l1
+                rep0 = d1
+                state = 1
+                continue
+        prevb := if pos > 0 then d[pos - 1] else 0
+        mb := if state != 0 then d[pos - rep0 - 1] else 0
+        e.bit(IS_MATCH + state, 0)
+        e.lit(prevb, d[pos], mb, state != 0)
+        pos += 1
+        state = 0
+    for _ in 0..5
+        e.shift_low()
+    e.out
+
+struct Dec
+    src List[int]
+    pos int
+    code int
+    rng int
+    p List[int]
+
+fn Dec.norm(mut self)
+    if rng < TOP
+        rng = rng.shl(8)
+        nb := if pos < src.len() then src[pos] else 0
+        code = code.shl(8).bit_or(nb)
+        pos += 1
+
+fn Dec.bit(mut self, i int) int
+    pr := p[i]
+    bound := rng.shr(11) * pr
+    mut b := 0
+    if code < bound
+        rng = bound
+        p[i] = pr + (2048 - pr).shr(5)
+    else
+        code -= bound
+        rng -= bound
+        p[i] = pr - pr.shr(5)
+        b = 1
+    norm()
+    b
+
+fn Dec.direct(mut self, nbits int) int
+    mut v := 0
+    for _ in 0..nbits
+        rng = rng.shr(1)
+        mut b := 0
+        if code >= rng
+            code -= rng
+            b = 1
+        v = v.shl(1).bit_or(b)
+        norm()
+    v
+
+fn Dec.tree(mut self, base int, nbits int) int
+    mut m := 1
+    for _ in 0..nbits
+        m = m * 2 + bit(base + m)
+    m - (1).shl(nbits)
+
+fn Dec.rtree(mut self, base int, nbits int) int
+    mut m := 1
+    mut v := 0
+    for i in 0..nbits
+        b := bit(base + m)
+        m = m * 2 + b
+        v = v.bit_or(b.shl(i))
+    v
+
+fn Dec.lit(mut self, prevb int, mb int, matched bool) int
+    base := LIT + prevb.shr(4) * 768
+    mut m := 1
+    mut mt := matched
+    mut i := 7
+    while i >= 0
+        mut b := 0
+        if mt
+            mbit := mb.shr(i).bit_and(1)
+            b = bit(base + 256 + mbit * 256 + m)
+            if mbit != b
+                mt = false
+        else
+            b = bit(base + m)
+        m = m * 2 + b
+        i -= 1
+    m - 256
+
+fn Dec.mlen(mut self, base int) int
+    if bit(base) == 0
+        return tree(base + 2, 3)
+    if bit(base + 1) == 0
+        return 8 + tree(base + 10, 3)
+    16 + tree(base + 18, 8)
+
+fn Dec.dist(mut self, l int) int
+    ctx := if l > 3 then 3 else l
+    s := tree(SLOT + ctx * 64, 6)
+    if s < 4
+        return s
+    n := s.shr(1) - 1
+    base := (2 + s.bit_and(1)).shl(n)
+    if n > 4
+        hi := direct(n - 4)
+        lo := rtree(ALIGN, 4)
+        return base + hi.shl(4) + lo
+    base + rtree(SPEC + s * 16, n)
+
+## Decodes `n` bytes from a block made by `compress`. A damaged block gives
+## an empty list (the caller checks the length and the CRC).
+pub fn decompress(src List[int], n int) List[int]
+    if src.len() < 5
+        return []
+    code := src[1].shl(24).bit_or(src[2].shl(16)).bit_or(src[3].shl(8)).bit_or(src[4])
+    mut dc := Dec(src: src, pos: 5, code: code, rng: 4294967295, p: [1024 for _ in 0..PROBS])
+    mut out := List[int]()
+    mut state := 0
+    mut rep0 := 0
+    while out.len() < n
+        pos := out.len()
+        if dc.bit(IS_MATCH + state) == 0
+            prevb := if pos > 0 then out[pos - 1] else 0
+            if state != 0 and pos <= rep0
+                return []
+            mb := if state != 0 then out[pos - rep0 - 1] else 0
+            out.push(dc.lit(prevb, mb, state != 0))
+            state = 0
+        else
+            mut l := 0
+            if dc.bit(IS_REP + state) == 1
+                l = dc.mlen(LEN_REP)
+                state = 2
+            else
+                l = dc.mlen(LEN_MATCH)
+                rep0 = dc.dist(l)
+                state = 1
+            l += MINLEN
+            at := pos - rep0 - 1
+            if at < 0 or pos + l > n
+                return []
+            for k in 0..l
+                out.push(out[at + k])
+    out
+
+@test fn roundtrips_text()
+    mut d := List[int]()
+    for i in 0..3000
+        d.push(97 + (i * i).bit_xor(i / 7) % 5)
+    for level in 1..=6
+        c := compress(d, level)
+        assert(c.len() < d.len())
+        assert_eq(decompress(c, d.len()), d)
+
+@test fn roundtrips_empty_and_tiny()
+    for n in 0..9
+        d := [7 for _ in 0..n]
+        assert_eq(decompress(compress(d, 5), n), d)

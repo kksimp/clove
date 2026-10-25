@@ -23,7 +23,7 @@ any block of any file.
 ```
 "CLV2" | u32 file count | u32 block count | u32 block size
 per file:  u16 name length | name (UTF-8, relative, no "..") | u64 size | u32 first block | u32 block count
-per block: u64 offset into the data | u32 packed length | u32 CRC32 of the raw block | u8 engine (0 stored, 1 cm)
+per block: u64 offset into the data | u32 packed length | u32 CRC32 of the raw block | u8 engine (0 stored, 1 cm, 2 lz)
 data: the packed blocks, in order
 ```
 

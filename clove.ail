@@ -1,18 +1,20 @@
-## clove: an archiver written in AIL, with its own context-mixing codec (cm/).
+## clove: an archiver written in AIL, with its own codecs: a fast LZ engine (lz/) and a
+## context-mixing engine (cm/), chosen per block.
 ##
-##     clove.ail a [-b BLOCK_KB] ARCHIVE PATH...        add files and directories
+##     clove.ail a [-m fast|max] [-b BLOCK_KB] ARCHIVE PATH...   add files and directories
 ##     clove.ail x ARCHIVE [DIR]                        extract (into DIR, default .)
 ##     clove.ail l [--json] ARCHIVE                     list
 ##     clove.ail t [--json] ARCHIVE                     test: decode every block, check CRCs
 ##     clove.ail read ARCHIVE FILE [--range A:B] [--out PATH]
 ##                                                      bytes A..B of one file, decoding only the blocks it needs
-##     clove.ail bench FILE [-b BLOCK_KB]               ratio and speed, with a round-trip check
+##     clove.ail bench FILE [-m fast|max] [-b BLOCK_KB]          ratio and speed, with a round-trip check
 ##
 ## Blocks are independent: they compress and decode on all cores (`par for`),
 ## and the index at the front of the archive finds any block with no scan.
 ## Format: README.md. Errors carry a rule ID (`clove.format`, `clove.usage`).
 
 use cm
+use lz
 
 MAGIC := b"CLV2"
 BATCH := 8
@@ -20,13 +22,13 @@ BLOCK := 131072
 
 USAGE := """
     usage: clove COMMAND ...
-      a [-b BLOCK_KB] ARCHIVE PATH...   add files and directories (block size default 128 KB)
+      a [-m fast|max] [-b BLOCK_KB] ARCHIVE PATH...   add (fast: LZ engine, max: context mixing; block 128 KB)
       x ARCHIVE [DIR]                   extract into DIR (default .)
       l [--json] ARCHIVE                list
       t [--json] ARCHIVE                test every block
       read ARCHIVE FILE [--range A:B] [--out PATH]
                                         part of one file; only the blocks it needs are decoded
-      bench FILE [-b BLOCK_KB]          ratio, speed and round-trip check
+      bench FILE [-m fast|max] [-b BLOCK_KB]   ratio, speed and round-trip check
     """
 
 error enum CloveError
@@ -81,7 +83,7 @@ fn raw_len(size int, bsize int, i int) int
     bsize.min(size - i * bsize)
 
 ## Compresses `data` block by block (a block that does not shrink is stored).
-fn pack(data bytes, bsize int) Packed
+fn pack(data bytes, bsize int, engine int) Packed
     nb := nblocks(data.len(), bsize)
     mut parts := [List[int]() for _ in 0..nb]
     mut crcs := [0 for _ in 0..nb]
@@ -94,13 +96,13 @@ fn pack(data bytes, bsize int) Packed
             raw := data[s..(s + bsize).min(data.len())]
             crcs[i] = hash.crc32(raw)
             blk := to_ints(raw)
-            c := cm.compress(blk)
+            c := if engine == 1 then cm.compress(blk) else lz.compress(blk, 5)
             parts[i] = if c.len() < blk.len() then c else blk
         for i in first..last
             all = all + to_bytes(parts[i])
         first = last
     clens := [q.len() for q in parts]
-    engines := [if clens[i] == raw_len(data.len(), bsize, i) then 0 else 1 for i in 0..nb]
+    engines := [if clens[i] == raw_len(data.len(), bsize, i) then 0 else engine for i in 0..nb]
     Packed(data: all, clens: clens, crcs: crcs, engines: engines)
 
 ## Decodes blocks `first..last` (positions in the arrays) on all cores; a block that
@@ -118,7 +120,10 @@ fn decode(
     mut out := [List[int]() for _ in 0..clens.len()]
     par for i in first..last
         comp := to_ints(data[offs[i]..offs[i] + clens[i]])
-        raw := if engines[i] == 0 then comp else cm.decompress(comp, rawlens[i])
+        raw := match engines[i]
+            0 => comp
+            1 => cm.decompress(comp, rawlens[i])
+            _ => lz.decompress(comp, rawlens[i])
         ok := raw.len() == rawlens[i] and hash.crc32(to_bytes(raw)) == crcs[i]
         out[i] = if ok then raw else List[int]()
     out
@@ -236,7 +241,7 @@ fn safe(name str) bool
             return false
     true
 
-fn cmd_add(archive str, paths List[str], bsize int) ! CloveError | fs.IoError
+fn cmd_add(archive str, paths List[str], bsize int, engine int) ! CloveError | fs.IoError
     files := collect(paths)?
     tmp := "{archive}.tmp"
     fs.write_bytes(tmp, b"")?
@@ -247,7 +252,7 @@ fn cmd_add(archive str, paths List[str], bsize int) ! CloveError | fs.IoError
         if not safe(f)
             return Usage(text: "refusing the name {f}")
         data := fs.read_bytes(f)?
-        p := pack(data, bsize)
+        p := pack(data, bsize, engine)
         ents.push(FileEnt(name: f, size: data.len(), first: all.clens.len(), nb: p.clens.len()))
         all.clens.extend(p.clens)
         all.crcs.extend(p.crcs)
@@ -350,10 +355,10 @@ fn mb_per_s(n int, ms int) str
     mbs := n.to_float() / 1048576.0 / (ms.to_float() / 1000.0)
     "{mbs:.2}"
 
-fn cmd_bench(path str, bsize int) ! CloveError | fs.IoError
+fn cmd_bench(path str, bsize int, engine int) ! CloveError | fs.IoError
     data := fs.read_bytes(path)?
     t0 := time.now_ms()
-    p := pack(data, bsize)
+    p := pack(data, bsize, engine)
     t1 := time.now_ms()
     nb := p.clens.len()
     mut offs := List[int]()
@@ -371,6 +376,7 @@ fn cmd_bench(path str, bsize int) ! CloveError | fs.IoError
 
 struct Opts
     bsize int
+    engine int
     json bool
     lo int
     hi int
@@ -378,7 +384,7 @@ struct Opts
     words List[str]
 
 fn parse(args List[str]) Opts ! CloveError
-    mut o := Opts(bsize: BLOCK, json: false, lo: 0, hi: -1, out: "", words: [])
+    mut o := Opts(bsize: BLOCK, engine: 2, json: false, lo: 0, hi: -1, out: "", words: [])
     mut i := 0
     while i < args.len()
         a := args[i]
@@ -386,6 +392,14 @@ fn parse(args List[str]) Opts ! CloveError
         if a == "-b"
             n := word.to_int() else return Usage(text: "-b needs a number of KB")
             o.bsize = n * 1024
+            i += 2
+        elif a == "-m"
+            if word == "fast"
+                o.engine = 2
+            elif word == "max"
+                o.engine = 1
+            else
+                return Usage(text: "-m is fast or max")
             i += 2
         elif a == "--json"
             o.json = true
@@ -421,7 +435,7 @@ fn main() !
     match args[0]
         "a" =>
             need(w, 2, "a needs ARCHIVE and PATH...")?
-            cmd_add(w[0], w[1..], o.bsize)?
+            cmd_add(w[0], w[1..], o.bsize, o.engine)?
         "x" =>
             need(w, 1, "x needs ARCHIVE")?
             cmd_extract(w[0], if w.len() > 1 then w[1] else ".")?
@@ -436,5 +450,5 @@ fn main() !
             cmd_read(w[0], w[1], o.lo, o.hi, o.out)?
         "bench" =>
             need(w, 1, "bench needs FILE")?
-            cmd_bench(w[0], o.bsize)?
+            cmd_bench(w[0], o.bsize, o.engine)?
         _ => print(USAGE)
