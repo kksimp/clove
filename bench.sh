@@ -1,13 +1,15 @@
 #!/bin/bash
 # Clove (native AIL build) against the usual tools, on one file.
-#   bench.sh FILE     from the repository root
-# Builds clove.ail natively (./ail build), then times gzip, xz, zstd and 7z where installed.
+#   bench.sh FILE     from the repository root; AIL=/path/to/ail (default ../ail)
+# Builds clove.ail natively, then times gzip, xz, zstd and 7z where installed.
+# For several kinds of data at once, with memory, use tools/bench-matrix.sh.
 set -eu
 f=${1:?usage: bench.sh FILE}
+f=$(cd "$(dirname "$f")" && pwd)/$(basename "$f")
+cd "$(git rev-parse --show-toplevel)"
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
-cd "$(git rev-parse --show-toplevel)"
-./ail build clove.ail -o "$tmp/clove" >/dev/null
+"${AIL:-../ail}/ail" build clove.ail -o "$tmp/clove" >/dev/null
 echo "== clove (AIL, native) =="; "$tmp/clove" bench "$f"
 size=$(wc -c <"$f")
 t() { # name, command writing the compressed file to $tmp/out

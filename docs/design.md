@@ -1,5 +1,22 @@
 # Clove design note (draft 2026-10-25)
 
+## Status (2026-10-25)
+
+| Part | State |
+|---|---|
+| CLV2 container: index at the front, independent blocks, CRC32 per block | implemented |
+| Engine `fast` (LZ77 + LZMA-style range-coded model) | implemented; ratio below 7-Zip's |
+| Engine `max` (context mixing: 8 hashed contexts, match model, 2 mixers, 2 SSE) | implemented; 8.7% below 7z -mx9 on enwik8 (20 MB), far slower |
+| `a`, `x`, `l`, `t`, `bench`, `read --range`, `--json` on `l` and `t`, rule IDs in errors | implemented |
+| Validated index parsing, path-safety rules, archive-level tests | implemented |
+| `grep`, `describe`, trigram index, MCP `serve` | in progress (separate branch) |
+| 4 KB-aligned blocks | planned, not built |
+| Shared learned prior | planned, not built |
+| Per-block automatic engine choice | planned (the engine byte exists; the writer uses `-m`) |
+| Executable filters and instruction contexts; deflate-inside recompression | planned |
+
+Everything below "The design" describes the target; the table says what exists.
+
 Goal (Kaleb, 2026-10-25): a novel compression algorithm for modern hardware, with
 AI-first features such as grep, designed SSD-first. All AIL, integer-only, so output
 is identical on every machine.

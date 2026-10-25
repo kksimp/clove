@@ -19,6 +19,8 @@ use lz
 MAGIC := b"CLV2"
 BATCH := 8
 BLOCK := 131072
+MAX_BLOCK := 1073741824
+MAX_SIZE := 281474976710656
 
 USAGE := """
     usage: clove COMMAND ...
@@ -153,45 +155,64 @@ fn unpack(
                 fs.append_bytes(dest, bytes.from_list(out[i]))?
         first = last
 
+## Reads and validates the index. Every field is range-checked before use, so a
+## damaged archive gives a `clove.format` error, never a trap.
 fn parse_archive(b bytes, path str) Archive ! CloveError
     if b.len() < 16 or b[0..4] != MAGIC
         return Bad(why: "{path} is not a CLV2 archive")
     nfiles := get(b, 4, 4)?
     nblk := get(b, 8, 4)?
     bsize := get(b, 12, 4)?
-    if bsize <= 0
-        return Bad(why: "block size 0")
+    if bsize < 4096 or bsize > MAX_BLOCK
+        return Bad(why: "block size {bsize} is outside 4 KB..1 GB")
+    if 16 + nfiles * 18 + nblk * 17 > b.len()
+        return Bad(why: "index claims {nfiles} files and {nblk} blocks, more than the archive holds")
     mut p := 16
     mut files := List[FileEnt]()
     mut total := 0
     for _ in 0..nfiles
         nlen := get(b, p, 2)?
-        name := b[p + 2..p + 2 + nlen].text()
+        if p + 18 + nlen > b.len()
+            return Bad(why: "truncated file entry at byte {p}")
+        name := b[p + 2..p + 2 + nlen].to_str() else return Bad(why: "file name at byte {p} is not UTF-8")
         size := get(b, p + 2 + nlen, 8)?
         first := get(b, p + 10 + nlen, 4)?
         nb := get(b, p + 14 + nlen, 4)?
-        if first != total or nb != nblocks(size, bsize)
+        if size > MAX_SIZE
+            return Bad(why: "{name}: declared size {size} is too large")
+        if first != total or nb != nblocks(size, bsize) or total + nb > nblk
             return Bad(why: "{name}: block range")
         files.push(FileEnt(name: name, size: size, first: first, nb: nb))
         total += nb
         p += 18 + nlen
     if total != nblk
-        return Bad(why: "block count")
+        return Bad(why: "files cover {total} blocks, the index has {nblk}")
+    if p + nblk * 17 > b.len()
+        return Bad(why: "truncated block index")
+    dstart := p + nblk * 17
     mut offs := List[int]()
     mut clens := List[int]()
     mut crcs := List[int]()
     mut engines := List[int]()
-    mut rel := List[int]()
-    for _ in 0..nblk
-        rel.push(get(b, p, 8)?)
-        clens.push(get(b, p + 8, 4)?)
-        crcs.push(get(b, p + 12, 4)?)
-        engines.push(get(b, p + 16, 1)?)
-        p += 17
-    for i in 0..nblk
-        if p + rel[i] + clens[i] > b.len()
-            return Bad(why: "truncated data")
-        offs.push(p + rel[i])
+    mut next := 0
+    for f in files
+        for k in 0..f.nb
+            rel := get(b, p, 8)?
+            clen := get(b, p + 8, 4)?
+            eng := get(b, p + 16, 1)?
+            raw := raw_len(f.size, bsize, k)
+            if rel != next
+                return Bad(why: "{f.name}: block {k} is not where the index says")
+            if eng > 2 or clen < 1 or clen > raw or (eng == 0) != (clen == raw)
+                return Bad(why: "{f.name}: block {k} has engine {eng} and length {clen} for {raw} bytes")
+            if dstart + rel + clen > b.len()
+                return Bad(why: "{f.name}: block {k} runs past the end of the archive")
+            offs.push(dstart + rel)
+            clens.push(clen)
+            crcs.push(get(b, p + 12, 4)?)
+            engines.push(eng)
+            next += clen
+            p += 17
     Archive(bsize: bsize, files: files, offs: offs, clens: clens, crcs: crcs, engines: engines)
 
 ## The arrays of one file's blocks, so `unpack` and `read` can work on a slice.
@@ -233,17 +254,25 @@ fn collect(paths List[str]) List[str] ! fs.IoError
             files.push(p)
     files
 
+## A stored name may only name a path inside the extraction directory, on every
+## platform: relative, "/"-separated, no "." or ".." or empty parts, no
+## backslash (Windows separator), no ":" (drive letters, streams), no control
+## characters.
 fn safe(name str) bool
-    if name == "" or name.starts_with("/") or name.contains(":")
+    if name == "" or name.starts_with("/") or name.contains(":") or name.contains("\\")
         return false
+    for c in name.chars()
+        if c.code() < 32
+            return false
     for part in name.split("/")
-        if part == ".."
+        if part == "" or part == "." or part == ".."
             return false
     true
 
-## Names are stored relative, as 7-Zip does: a leading "/" or "./" is dropped.
+## Names are stored relative, as 7-Zip does: backslashes become "/", and a
+## leading "/" or "./" is dropped.
 fn stored_name(path str) str
-    mut s := path
+    mut s := path.replace("\\", "/")
     while s.starts_with("/") or s.starts_with("./")
         s = s.slice(if s.starts_with("/") then 1 else 2, s.len())
     s
@@ -463,8 +492,8 @@ fn parse(args List[str]) Opts ! CloveError
         else
             o.words.push(a)
             i += 1
-    if o.bsize < 4096
-        return Usage(text: "the block is at least 4 KB")
+    if o.bsize < 4096 or o.bsize > MAX_BLOCK
+        return Usage(text: "the block is 4 KB to 1 GB")
     o
 
 fn need(w List[str], n int, what str) ! CloveError
@@ -498,3 +527,82 @@ fn main() !
             need(w, 1, "bench needs FILE")?
             cmd_bench(w[0], o.bsize, o.engine)?
         _ => print(USAGE)
+
+## Archive-level tests. They write under target/clove-test (git-ignored).
+
+TEST_DIR := "target/clove-test"
+
+fn test_bytes(n int, seed int) bytes
+    mut xs := List[u8]()
+    mut x := seed
+    for i in 0..n
+        x = (x * 1103515245 + 12345).bit_and(2147483647)
+        v := if i % 3 == 0 then x.shr(16).bit_and(255) else 97 + (i / 7) % 13
+        xs.push(v.to_u8())
+    bytes.from_list(xs)
+
+fn make_tree(root str) ! fs.IoError
+    fs.make_dir("{root}/src/deep/er")?
+    fs.write_bytes("{root}/empty.txt", b"")?
+    fs.write_bytes("{root}/src/one.txt", "hello clove\n".to_bytes())?
+    fs.write_bytes("{root}/src/deep/big.bin", test_bytes(70000, 7))?
+    fs.write_bytes("{root}/src/deep/er/exact.bin", test_bytes(8192, 3))?
+
+fn same_file(a str, b str) bool ! fs.IoError
+    fs.read_bytes(a)? == fs.read_bytes(b)?
+
+@test fn add_extract_round_trip_both_engines()
+    for engine in [2, 1]
+        root := "{TEST_DIR}/rt{engine}"
+        make_tree("{root}/in")?
+        arc := "{root}/t.clove"
+        cmd_add(arc, ["{root}/in"], 4096, engine)?
+        cmd_test(arc, false)?
+        cmd_extract(arc, "{root}/out")?
+        for f in ["empty.txt", "src/one.txt", "src/deep/big.bin", "src/deep/er/exact.bin"]
+            assert(same_file("{root}/in/{f}", "{root}/out/{root}/in/{f}")?)
+
+@test fn range_reads_at_block_boundaries()
+    root := "{TEST_DIR}/range"
+    make_tree("{root}/in")?
+    arc := "{root}/t.clove"
+    cmd_add(arc, ["{root}/in/src/deep/big.bin"], 4096, 2)?
+    whole := fs.read_bytes("{root}/in/src/deep/big.bin")?
+    name := "{root}/in/src/deep/big.bin"
+    los := [0, 4095, 4096, 8191, 69999, 0, 100]
+    his := [1, 4097, 8192, 12289, 70000, 70000, 100]
+    for i in 0..los.len()
+        cmd_read(arc, name, los[i], his[i], "{root}/part")?
+        if los[i] < his[i]
+            assert(fs.read_bytes("{root}/part")? == whole[los[i]..his[i]])
+
+@test fn damaged_archives_give_format_errors()
+    root := "{TEST_DIR}/bad"
+    make_tree("{root}/in")?
+    arc := "{root}/t.clove"
+    cmd_add(arc, ["{root}/in/src"], 4096, 2)?
+    good := fs.read_bytes(arc)?
+    # Every truncation is refused: the index says where each block ends.
+    for n in [0, 3, 4, 15, 16, 17, 30, 60, 100, 200, good.len() / 2, good.len() - 1]
+        cut := parse_archive(good[0..n], "cut") else continue
+        assert_eq(cut.files.len(), -1)
+    # Flipping any index byte gives an error or a CRC failure, never a trap.
+    a0 := parse_archive(good, "good")?
+    index_end := a0.offs[0]
+    mut flips := 0
+    for pos in 4..index_end
+        mut xs := good.to_list()
+        xs[pos] = (xs[pos].to_int().bit_xor(255)).to_u8()
+        bad := bytes.from_list(xs)
+        fs.write_bytes("{root}/flip.clove", bad)?
+        cmd_test("{root}/flip.clove", false) else continue
+        flips += 1
+    assert(flips < index_end)
+
+@test fn unsafe_names_are_refused()
+    for n in ["/etc/passwd", "../x", "a/../../x", "..\\x", "a\\..\\x", "C:x", "C:\\x", "\\\\server\\share", "a//b", "./a", "a/./b", "", "a\u{1}b"]
+        assert(not safe(n))
+    for n in ["a", "a/b.txt", "src/deep/er/exact.bin", "..a", "a..", "na\u{ef}ve.txt"]
+        assert(safe(n))
+    assert_eq(stored_name("/abs/path.txt"), "abs/path.txt")
+    assert_eq(stored_name(".\\win\\path.txt"), "win/path.txt")
