@@ -110,7 +110,7 @@ struct Model
     mbits int
     a1 List[int]
     a2 List[int]
-    buf List[int]
+    buf List[u8]
     sq List[int]
     dt List[int]
     c0 int
@@ -213,7 +213,7 @@ fn Model.predict(mut self) int
     st[9] = 0
     mctx = -1
     if mlen > 0
-        e := buf[mptr]
+        e := buf[mptr].to_int()
         if (e + 256).shr(8 - bitpos) == c0
             active = 1
             eb := e.shr(7 - bitpos).bit_and(1)
@@ -273,7 +273,7 @@ fn Model.update(mut self, y int)
     set_idx()
 
 fn Model.end_byte(mut self, b int)
-    buf.push(b)
+    buf.push(b.to_u8())
     c8 = c8.shl(8).bit_and(4294967295).bit_or(c4.shr(24))
     c4 = c4.shl(8).bit_and(4294967295).bit_or(b)
     lower := if b >= 65 and b <= 90 then b + 32 else b
@@ -291,7 +291,7 @@ fn Model.end_byte(mut self, b int)
     hv[6] = fold(word0.bit_xor(word1 * 1000003) * 97) + 7
     hv[7] = fold(c4.shr(8).bit_and(65535) * 2246822519) + 8
     n := buf.len()
-    if mlen > 0 and buf[mptr] == b
+    if mlen > 0 and buf[mptr].to_int() == b
         mlen += 1
         mptr += 1
     else
@@ -309,15 +309,16 @@ fn Model.end_byte(mut self, b int)
     mtab[h] = n
 
 struct Coder
-    out List[int]
+    out List[u8]
     x1 int
     x2 int
 
-## Compresses `d` (bytes as ints) to a self-contained block.
-pub fn compress(d List[int]) List[int]
+## Compresses `d` to a self-contained block.
+pub fn compress(d List[u8]) List[u8]
     mut m := new_model(d.len())
     mut c := Coder(out: [], x1: 0, x2: 4294967295)
-    for b in d
+    for byte in d
+        b := byte.to_int()
         mut i := 7
         while i >= 0
             y := b.shr(i).bit_and(1)
@@ -329,27 +330,27 @@ pub fn compress(d List[int]) List[int]
                 c.x1 = xmid + 1
             m.update(y)
             while c.x1.bit_xor(c.x2).bit_and(4278190080) == 0
-                c.out.push(c.x2.shr(24))
+                c.out.push(c.x2.shr(24).to_u8())
                 c.x1 = c.x1.shl(8).bit_and(4294967295)
                 c.x2 = c.x2.shl(8).bit_and(4294967295).bit_or(255)
             i -= 1
-    c.out.push(c.x1.shr(24))
-    c.out.push(c.x1.shr(16).bit_and(255))
-    c.out.push(c.x1.shr(8).bit_and(255))
-    c.out.push(c.x1.bit_and(255))
+    c.out.push(c.x1.shr(24).to_u8())
+    c.out.push(c.x1.shr(16).bit_and(255).to_u8())
+    c.out.push(c.x1.shr(8).bit_and(255).to_u8())
+    c.out.push(c.x1.bit_and(255).to_u8())
     c.out
 
 ## Decodes `n` bytes. A damaged block gives wrong bytes, which the caller's CRC catches.
-pub fn decompress(src List[int], n int) List[int]
+pub fn decompress(src List[u8], n int) List[u8]
     mut m := new_model(n)
     mut pos := 0
     mut x := 0
     for _ in 0..4
-        x = x.shl(8).bit_or(if pos < src.len() then src[pos] else 0)
+        x = x.shl(8).bit_or(if pos < src.len() then src[pos].to_int() else 0)
         pos += 1
     mut x1 := 0
     mut x2 := 4294967295
-    mut out := List[int]()
+    mut out := List[u8]()
     for _byte in 0..n
         for _bit in 0..8
             p := m.predict()
@@ -364,32 +365,32 @@ pub fn decompress(src List[int], n int) List[int]
             while x1.bit_xor(x2).bit_and(4278190080) == 0
                 x1 = x1.shl(8).bit_and(4294967295)
                 x2 = x2.shl(8).bit_and(4294967295).bit_or(255)
-                nb := if pos < src.len() then src[pos] else 0
+                nb := if pos < src.len() then src[pos].to_int() else 0
                 x = x.shl(8).bit_and(4294967295).bit_or(nb)
                 pos += 1
         out.push(m.buf[m.buf.len() - 1])
     out
 
 @test fn roundtrips_text()
-    mut d := List[int]()
+    mut d := List[u8]()
     for i in 0..3000
-        d.push(97 + (i * i).bit_xor(i / 7) % 5)
+        d.push((97 + (i * i).bit_xor(i / 7) % 5).to_u8())
     c := compress(d)
     assert(c.len() < d.len())
     assert_eq(decompress(c, d.len()), d)
 
 @test fn roundtrips_tiny()
     for n in 0..5
-        d := [200 for _ in 0..n]
+        d := [(200).to_u8() for _ in 0..n]
         assert_eq(decompress(compress(d), n), d)
 
 @test fn roundtrips_words_and_binary()
     text := "the quick brown fox jumps over the lazy dog; The Quick Brown Fox! ".to_bytes()
-    mut d := List[int]()
+    mut d := List[u8]()
     for i in 0..400
         for x in text
-            d.push(x.to_int())
-        d.push((i * 37).bit_and(255))
+            d.push(x)
+        d.push((i * 37).bit_and(255).to_u8())
     c := compress(d)
     assert(c.len() * 4 < d.len())
     assert_eq(decompress(c, d.len()), d)

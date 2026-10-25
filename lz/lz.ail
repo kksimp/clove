@@ -24,7 +24,7 @@ ALIGN := 14356
 PROBS := 14372
 
 struct Enc
-    out List[int]
+    out List[u8]
     lo int
     rng int
     cache int
@@ -34,10 +34,10 @@ struct Enc
 fn Enc.shift_low(mut self)
     if lo < 4278190080 or lo >= 4294967296
         carry := lo.shr(32)
-        out.push((cache + carry).bit_and(255))
+        out.push((cache + carry).bit_and(255).to_u8())
         csize -= 1
         while csize > 0
-            out.push((255 + carry).bit_and(255))
+            out.push((255 + carry).bit_and(255).to_u8())
             csize -= 1
         cache = lo.shr(24).bit_and(255)
     csize += 1
@@ -170,24 +170,24 @@ fn rep_push(mut reps List[int], d int)
     reps[1] = reps[0]
     reps[0] = d
 
-fn hash4(d List[int], pos int) int
-    v := d[pos] + d[pos + 1].shl(8) + d[pos + 2].shl(16) + d[pos + 3].shl(24)
+fn hash4(d List[u8], pos int) int
+    v := d[pos].to_int() + d[pos + 1].to_int().shl(8) + d[pos + 2].to_int().shl(16) + d[pos + 3].to_int().shl(24)
     (v * 789008181).shr(20).bit_and(262143)
 
-fn ins(mut head List[int], mut prev List[int], d List[int], pos int, n int)
+fn ins(mut head List[int], mut prev List[int], d List[u8], pos int, n int)
     if pos + MINLEN <= n
         h := hash4(d, pos)
         prev[pos] = head[h]
         head[h] = pos + 1
 
-fn match_len(d List[int], a int, b int, limit int) int
+fn match_len(d List[u8], a int, b int, limit int) int
     mut k := 0
     while k < limit and d[a + k] == d[b + k]
         k += 1
     k
 
 ## The longest earlier match for `pos`: (length, distance - 1), length 0 if none.
-fn find(d List[int], prev List[int], head List[int], pos int, n int, depth int)(int, int)
+fn find(d List[u8], prev List[int], head List[int], pos int, n int, depth int)(int, int)
     if pos + MINLEN > n
         return (0, 0)
     limit := MAXLEN.min(n - pos)
@@ -224,7 +224,7 @@ fn depth_of(level int) int
     256
 
 ## Compresses `d` (bytes as ints) to a self-contained range-coded block.## Compresses `d` (bytes as ints) to a self-contained range-coded block.
-pub fn compress(d List[int], level int) List[int]
+pub fn compress(d List[u8], level int) List[u8]
     n := d.len()
     depth := depth_of(level)
     lazy := level >= 3
@@ -292,8 +292,8 @@ pub fn compress(d List[int], level int) List[int]
                 rep_push(mut reps, d1)
                 state = after_match(state)
                 continue
-        mb := if pos > reps[0] then d[pos - reps[0] - 1] else -1
-        if mb == d[pos]
+        mb := if pos > reps[0] then d[pos - reps[0] - 1].to_int() else -1
+        if mb == d[pos].to_int()
             e.bit(IS_MATCH + state * 4 + ps, 1)
             e.bit(IS_REP + state, 1)
             e.bit(IS_G0 + state, 0)
@@ -302,8 +302,8 @@ pub fn compress(d List[int], level int) List[int]
             state = after_short(state)
             continue
         e.bit(IS_MATCH + state * 4 + ps, 0)
-        prevb := if pos > 0 then d[pos - 1] else 0
-        e.lit(prevb, d[pos], mb, state >= 7)
+        prevb := if pos > 0 then d[pos - 1].to_int() else 0
+        e.lit(prevb, d[pos].to_int(), mb, state >= 7)
         pos += 1
         state = after_lit(state)
     for _ in 0..5
@@ -311,7 +311,7 @@ pub fn compress(d List[int], level int) List[int]
     e.out
 
 struct Dec
-    src List[int]
+    src List[u8]
     pos int
     code int
     rng int
@@ -320,7 +320,7 @@ struct Dec
 fn Dec.norm(mut self)
     if rng < TOP
         rng = rng.shl(8)
-        nb := if pos < src.len() then src[pos] else 0
+        nb := if pos < src.len() then src[pos].to_int() else 0
         code = code.shl(8).bit_or(nb)
         pos += 1
 
@@ -406,21 +406,21 @@ fn Dec.dist(mut self, l int) int
 
 ## Decodes `n` bytes from a block made by `compress`. A damaged block gives
 ## an empty list (the caller checks the length and the CRC).
-pub fn decompress(src List[int], n int) List[int]
+pub fn decompress(src List[u8], n int) List[u8]
     if src.len() < 5
         return []
-    code := src[1].shl(24).bit_or(src[2].shl(16)).bit_or(src[3].shl(8)).bit_or(src[4])
+    code := src[1].to_int().shl(24).bit_or(src[2].to_int().shl(16)).bit_or(src[3].to_int().shl(8)).bit_or(src[4].to_int())
     mut dc := Dec(src: src, pos: 5, code: code, rng: 4294967295, p: [1024 for _ in 0..PROBS])
-    mut out := List[int]()
+    mut out := List[u8]()
     mut state := 0
     mut reps := [0, 0, 0, 0]
     while out.len() < n
         pos := out.len()
         ps := pos.bit_and(3)
         if dc.bit(IS_MATCH + state * 4 + ps) == 0
-            prevb := if pos > 0 then out[pos - 1] else 0
-            mb := if pos > reps[0] then out[pos - reps[0] - 1] else -1
-            out.push(dc.lit(prevb, mb, state >= 7))
+            prevb := if pos > 0 then out[pos - 1].to_int() else 0
+            mb := if pos > reps[0] then out[pos - reps[0] - 1].to_int() else -1
+            out.push(dc.lit(prevb, mb, state >= 7).to_u8())
             state = after_lit(state)
             continue
         mut l := 0
@@ -451,9 +451,9 @@ pub fn decompress(src List[int], n int) List[int]
     out
 
 @test fn roundtrips_text()
-    mut d := List[int]()
+    mut d := List[u8]()
     for i in 0..3000
-        d.push(97 + (i * i).bit_xor(i / 7) % 5)
+        d.push((97 + (i * i).bit_xor(i / 7) % 5).to_u8())
     for level in 1..=6
         c := compress(d, level)
         assert(c.len() < d.len())
@@ -461,15 +461,15 @@ pub fn decompress(src List[int], n int) List[int]
 
 @test fn roundtrips_empty_and_tiny()
     for n in 0..9
-        d := [7 for _ in 0..n]
+        d := [(7).to_u8() for _ in 0..n]
         assert_eq(decompress(compress(d, 5), n), d)
 
 @test fn roundtrips_repeat_distances()
-    words := [[104, 101, 108, 108, 111], [119, 111, 114, 108, 100], [97, 105, 108]]
-    mut d := List[int]()
+    words := ["hello".to_bytes().to_list(), "world".to_bytes().to_list(), "ail".to_bytes().to_list()]
+    mut d := List[u8]()
     for i in 0..2000
         d.extend(words[(i * 7 + i / 3) % 3])
-        d.push(32 + i % 2)
-        d.push((i * 31) % 256)
+        d.push((32 + i % 2).to_u8())
+        d.push(((i * 31) % 256).to_u8())
     for level in [1, 5]
         assert_eq(decompress(compress(d, level), d.len()), d)

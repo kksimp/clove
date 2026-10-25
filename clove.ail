@@ -85,7 +85,7 @@ fn raw_len(size int, bsize int, i int) int
 ## Compresses `data` block by block (a block that does not shrink is stored).
 fn pack(data bytes, bsize int, engine int) Packed
     nb := nblocks(data.len(), bsize)
-    mut parts := [List[int]() for _ in 0..nb]
+    mut parts := [List[u8]() for _ in 0..nb]
     mut crcs := [0 for _ in 0..nb]
     mut all := b""
     mut first := 0
@@ -95,11 +95,11 @@ fn pack(data bytes, bsize int, engine int) Packed
             s := i * bsize
             raw := data[s..(s + bsize).min(data.len())]
             crcs[i] = hash.crc32(raw)
-            blk := to_ints(raw)
+            blk := raw.to_list()
             c := if engine == 1 then cm.compress(blk) else lz.compress(blk, 5)
             parts[i] = if c.len() < blk.len() then c else blk
         for i in first..last
-            all = all + to_bytes(parts[i])
+            all = all + bytes.from_list(parts[i])
         first = last
     clens := [q.len() for q in parts]
     engines := [if clens[i] == raw_len(data.len(), bsize, i) then 0 else engine for i in 0..nb]
@@ -116,16 +116,16 @@ fn decode(
     rawlens List[int],
     first int,
     last int,
-) List[List[int]]
-    mut out := [List[int]() for _ in 0..clens.len()]
+) List[List[u8]]
+    mut out := [List[u8]() for _ in 0..clens.len()]
     par for i in first..last
-        comp := to_ints(data[offs[i]..offs[i] + clens[i]])
+        comp := data[offs[i]..offs[i] + clens[i]].to_list()
         raw := match engines[i]
             0 => comp
             1 => cm.decompress(comp, rawlens[i])
             _ => lz.decompress(comp, rawlens[i])
-        ok := raw.len() == rawlens[i] and hash.crc32(to_bytes(raw)) == crcs[i]
-        out[i] = if ok then raw else List[int]()
+        ok := raw.len() == rawlens[i] and hash.crc32(bytes.from_list(raw)) == crcs[i]
+        out[i] = if ok then raw else List[u8]()
     out
 
 ## Decodes and checks the given blocks, batch by batch on all cores; unless dest is "",
@@ -150,7 +150,7 @@ fn unpack(
             if out[i].len() != rawlens[i]
                 return Bad(why: "{name}: block {i} is damaged")
             if dest != ""
-                fs.append_bytes(dest, to_bytes(out[i]))?
+                fs.append_bytes(dest, bytes.from_list(out[i]))?
         first = last
 
 fn parse_archive(b bytes, path str) Archive ! CloveError
@@ -373,12 +373,12 @@ fn cmd_read(archive str, name str, lo int, hi int, out str) ! CloveError | fs.Io
         0,
         cnt,
     )
-    mut buf := List[int]()
+    mut buf := List[u8]()
     for i in 0..cnt
         if got[i].len() != rawlens[i]
             return Bad(why: "{name}: block {b0 + i} is damaged")
         buf.extend(got[i])
-    part := to_bytes(buf[lo - b0 * a.bsize..end - b0 * a.bsize])
+    part := bytes.from_list(buf[lo - b0 * a.bsize..end - b0 * a.bsize])
     if out == ""
         print(part.text())
     else
