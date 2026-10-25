@@ -275,7 +275,16 @@ fn cmd_extract(archive str, dir str) ! CloveError | fs.IoError
         parts := dest.split("/")
         if parts.len() > 1
             fs.make_dir(parts[0..parts.len() - 1].join("/"))?
-        unpack(f.name, b, slice(a.offs, f.first, f.nb), slice(a.clens, f.first, f.nb), slice(a.engines, f.first, f.nb), slice(a.crcs, f.first, f.nb), file_rawlens(a, f), dest)?
+        unpack(
+            f.name,
+            b,
+            slice(a.offs, f.first, f.nb),
+            slice(a.clens, f.first, f.nb),
+            slice(a.engines, f.first, f.nb),
+            slice(a.crcs, f.first, f.nb),
+            file_rawlens(a, f),
+            dest,
+        )?
         print("{f.name}")
 
 fn packed_of(a Archive, f FileEnt) int
@@ -310,7 +319,16 @@ fn cmd_test(archive str, json bool) ! CloveError | fs.IoError
     b := fs.read_bytes(archive)?
     a := parse_archive(b, archive)?
     for f in a.files
-        unpack(f.name, b, slice(a.offs, f.first, f.nb), slice(a.clens, f.first, f.nb), slice(a.engines, f.first, f.nb), slice(a.crcs, f.first, f.nb), file_rawlens(a, f), "")?
+        unpack(
+            f.name,
+            b,
+            slice(a.offs, f.first, f.nb),
+            slice(a.clens, f.first, f.nb),
+            slice(a.engines, f.first, f.nb),
+            slice(a.crcs, f.first, f.nb),
+            file_rawlens(a, f),
+            "",
+        )?
     if json
         print("\{\"ok\": true, \"files\": {a.files.len()}}")
     else
@@ -337,7 +355,16 @@ fn cmd_read(archive str, name str, lo int, hi int, out str) ! CloveError | fs.Io
     g0 := f.first + b0
     cnt := b1 - b0
     rawlens := [raw_len(f.size, a.bsize, b0 + i) for i in 0..cnt]
-    got := decode(b, slice(a.offs, g0, cnt), slice(a.clens, g0, cnt), slice(a.engines, g0, cnt), slice(a.crcs, g0, cnt), rawlens, 0, cnt)
+    got := decode(
+        b,
+        slice(a.offs, g0, cnt),
+        slice(a.clens, g0, cnt),
+        slice(a.engines, g0, cnt),
+        slice(a.crcs, g0, cnt),
+        rawlens,
+        0,
+        cnt,
+    )
     mut buf := List[int]()
     for i in 0..cnt
         if got[i].len() != rawlens[i]
@@ -366,7 +393,16 @@ fn cmd_bench(path str, bsize int, engine int) ! CloveError | fs.IoError
     for c in p.clens
         offs.push(o)
         o += c
-    unpack(path, p.data, offs, p.clens, p.engines, p.crcs, [raw_len(data.len(), bsize, i) for i in 0..nb], "")?
+    unpack(
+        path,
+        p.data,
+        offs,
+        p.clens,
+        p.engines,
+        p.crcs,
+        [raw_len(data.len(), bsize, i) for i in 0..nb],
+        "",
+    )?
     t2 := time.now_ms()
     ratio := data.len().to_float() / p.data.len().max(1).to_float()
     print("{path}: {data.len()} -> {p.data.len()} bytes, ratio {ratio:.3}")
