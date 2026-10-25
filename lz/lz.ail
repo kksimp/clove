@@ -449,6 +449,7 @@ pub fn decompress(src List[int], n int) List[int]
         for k in 0..l
             out.push(out[at + k])
     out
+
 @test fn roundtrips_text()
     mut d := List[int]()
     for i in 0..3000
@@ -462,7 +463,6 @@ pub fn decompress(src List[int], n int) List[int]
     for n in 0..9
         d := [7 for _ in 0..n]
         assert_eq(decompress(compress(d, 5), n), d)
-
 
 @test fn roundtrips_repeat_distances()
     words := [[104, 101, 108, 108, 111], [119, 111, 114, 108, 100], [97, 105, 108]]
