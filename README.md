@@ -7,29 +7,33 @@ same bytes. It is the larger program for comparing AIL with C and with 7-Zip.
 
 ```sh
 ./ail run clove.ail a out.clove src/ notes.txt    # add (block size with -b KB)
-./ail run clove.ail l out.clove                   # list
+./ail run clove.ail l --json out.clove            # list (--json for agents)
 ./ail run clove.ail t out.clove                   # test: decode every block, check CRCs
 ./ail run clove.ail x out.clove dir               # extract
+./ail run clove.ail read out.clove a.txt --range 0:4096   # part of one file, decoding only its blocks
 ./ail run clove.ail bench corpus.txt              # ratio, speed, round-trip check
 bench.sh corpus.txt                               # native build vs gzip/xz/zstd/7z
 ```
 
-## Archive format (`CLV1`)
+## Archive format (`CLV2`)
 
-All integers are little-endian.
+All integers are little-endian. The whole index is at the front, so one read finds
+any block of any file.
 
 ```
-"CLV1"
-entry*  until end of file:
-  u16 name length | name (UTF-8, relative, no "..", no leading "/")
-  u64 size | u32 block size | u32 block count
-  per block: u32 compressed length | u32 CRC32 of the raw block
-  the blocks' bytes, in order
+"CLV2" | u32 file count | u32 block count | u32 block size
+per file:  u16 name length | name (UTF-8, relative, no "..") | u64 size | u32 first block | u32 block count
+per block: u64 offset into the data | u32 packed length | u32 CRC32 of the raw block | u8 engine (0 stored, 1 cm)
+data: the packed blocks, in order
 ```
 
-A block whose compressed length equals its raw length is stored raw. Blocks are
-independent (default 4 MB), so compression, decoding and testing run one block per
-core with `par for`.
+Blocks (default 128 KB) are independent, so `a`, `x`, `t` and `read` work one block per
+core with `par for`, and `read FILE --range A:B` decodes only the blocks it needs.
+
+## Error rules
+
+- `clove.usage`: a command line the tool can't act on; the message says what is missing.
+- `clove.format`: the archive is not CLV2, is truncated, or a block fails its CRC.
 
 ## The codec (`cm/cm.ail`; the code is the spec)
 
