@@ -44,6 +44,27 @@ head -c 200 "$tmp/long.txt" | tail -c 100 | cmp -s - "$tmp/part" || red "read --
 clove a -b 4 "$tmp/edge.clove" "$tmp/edge.txt" >/dev/null || red "add edge"
 clove grep "$tmp/edge.clove" "straddle-word" | grep -q "straddle-word" || red "boundary match missed"
 
+# short queries (1 and 2 bytes) cannot use the trigram filter and must scan; UTF-8 text is matched as bytes
+printf 'caf\xc3\xa9 au lait\nna\xc3\xafve\nplain\ncaf\xc3\xa9\n' > "$tmp/utf.txt"
+clove a -b 4 "$tmp/utf.clove" "$tmp/utf.txt" >/dev/null || red "add utf"
+for pat in "x" "ai" $'caf\xc3\xa9' $'\xc3\xaf'; do
+  want=$(grep -n -F -- "$pat" "$tmp/utf.txt" | cut -d: -f1 | tr '\n' ' ')
+  got=$(clove grep "$tmp/utf.clove" "$pat" | cut -d: -f2 | tr '\n' ' ')
+  [ "$want" = "$got" ] || red "short or UTF-8 query '$pat': want [$want] got [$got]"
+done
+clove grep -i "$tmp/utf.clove" $'CAF\xc3\x89' | grep -q . && red "-i folds ASCII only: a non-ASCII byte must not match its upper case"
+# -i folds ASCII across a block boundary
+clove a -b 4 "$tmp/edge2.clove" "$tmp/edge.txt" >/dev/null
+clove grep -i "$tmp/edge2.clove" "STRADDLE-WORD" | grep -q "straddle-word" || red "-i boundary match missed"
+# binary blocks are skipped unless -a
+clove grep --json "$a" "zzzqqq-not-there" | grep -q '"skipped_binary": [1-9]' || red "binary blocks should be counted as skipped"
+
+# one long line holding the text in two blocks counts once, and the next line is number 2
+{ printf 'ab'; head -c 4200 /dev/zero | tr '\0' 'y'; printf 'ab\nab\n'; } > "$tmp/dup.txt"
+clove a -b 4 "$tmp/dup.clove" "$tmp/dup.txt" >/dev/null || red "add dup"
+got=$(clove grep "$tmp/dup.clove" "ab" | cut -d: -f2 | tr '\n' ' ')
+[ "$got" = "1 2 " ] || red "a line that spans blocks must be one hit: want [1 2 ] got [$got]"
+
 # serve: initialize, list the tools, grep through a tool call
 resp=$(printf '%s\n' \
   '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}' \

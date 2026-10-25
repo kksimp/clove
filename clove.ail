@@ -518,6 +518,7 @@ fn run_grep(
             for j in 1..f.nb
                 pre[j] = pre[j - 1] + ix.nl[f.first + j - 1]
         mut running := 0
+        mut last_end := -1
         mut c0 := 0
         while c0 < cands.len() and not r.truncated
             c1 := (c0 + CHUNK).min(cands.len())
@@ -549,20 +550,27 @@ fn run_grep(
                 own := bytes.from_list(got[at[j]])
                 buf := if j + 1 < f.nb then own + bytes.from_list(got[at[j + 1]]) else own
                 before := if ix.ok then pre[j] else running
+                mut lastp := 0
+                mut nlc := 0
                 for p in search.scan(buf, own.len(), pb, fold)
                     if r.hits.len() >= max
                         r.truncated = true
                         break
+                    if j * a.bsize + p < last_end
+                        continue
                     s := search.line_start(buf, p)
+                    nlc += search.newlines(buf, lastp, s)
+                    lastp = s
                     w := (p - HITTEXT / 4).max(s)
-                    e := search.line_end(buf, p).min(w + HITTEXT)
+                    e := search.line_end(buf, p)
+                    last_end = j * a.bsize + e
                     r.hits.push(Hit(
                         file: f.name,
-                        line: before + search.newlines(buf, s) + 1,
+                        line: before + nlc + 1,
                         offset: j * a.bsize + p,
-                        text: buf[w..e].text(),
+                        text: buf[w..e.min(w + HITTEXT)].text(),
                     ))
-                running += search.newlines(own, own.len())
+                running += search.newlines(own, 0, own.len())
                 if r.truncated
                     break
             c0 = c1
@@ -580,7 +588,12 @@ fn grep_json(r Found, archive str, pat str) str
 fn cmd_grep(archive str, pat str, o Opts) ! CloveError | fs.IoError
     r := run_grep(archive, pat, o.fold, o.binary, o.max, o.only)?
     if o.json
-        print(grep_json(r, archive, pat))
+        # One hit per line inside the array, so a million hits are not joined into one string.
+        print("\{\"archive\": {js(archive)}, \"pattern\": {js(pat)}, \"hits\": [")
+        for i in 0..r.hits.len()
+            h := r.hits[i]
+            print("\{\"file\": {js(h.file)}, \"line\": {h.line}, \"offset\": {h.offset}, \"text\": {js(h.text)}}{if i + 1 < r.hits.len() then "," else ""}")
+        print("], \"truncated\": {r.truncated}, \"indexed\": {r.indexed}, \"blocks\": {r.blocks}, \"decoded\": {r.decoded}, \"skipped_binary\": {r.skipped}}")
         return
     for h in r.hits
         print("{h.file}:{h.line}:{h.text}")
