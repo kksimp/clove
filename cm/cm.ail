@@ -189,7 +189,8 @@ fn Model.set_idx(mut self)
     if bitpos == 0 or bitpos == 4
         bmask := (1).shl(tbits - 4) - 1
         for i in 0..NORD
-            bkt[i] = ((hv[i] + c0 * 40503) * 2654435761).shr(20).bit_and(bmask).shl(4) + i.shl(tbits)
+            bkt[i] = ((hv[i] + c0 * 40503) * 2654435761).shr(20).bit_and(bmask).shl(4)
+                + i.shl(tbits)
     nib := if bitpos < 4 then c0 else (1).shl(bitpos - 4) + c0.bit_and((1).shl(bitpos - 4) - 1)
     for i in 0..NORD
         idx[i] = bkt[i] + nib
