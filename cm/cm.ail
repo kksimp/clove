@@ -259,14 +259,16 @@ fn Model.update(mut self, y int)
     a1[j1] += (g - a1[j1]) / 128
     j2 := i2 * 33 + near
     a2[j2] += (g - a2[j2]) / 128
-    o0[c0] = adapt(o0[c0], y, LIMIT)
+    e0 := adapt(o0[c0], y, LIMIT)
+    o0[c0] = e0
     for i in 0..NORD
         j := idx[i]
         old := slot(j)
         upd := adapt(old, y, LIMIT)
         set_slot(j, upd)
     if mctx >= 0
-        msm[mctx] = adapt(msm[mctx], y, 1023)
+        em := adapt(msm[mctx], y, 1023)
+        msm[mctx] = em
     c0 = c0 * 2 + y
     bitpos += 1
     if bitpos == 8
