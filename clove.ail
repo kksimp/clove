@@ -948,12 +948,15 @@ fn same_file(a str, b str) bool ! fs.IoError
     arc := "{root}/t.clove"
     cmd_add(arc, ["{root}/in/src"], 4096, 2)?
     good := fs.read_bytes(arc)?
-    # Every truncation is refused: the index says where each block ends.
-    for n in [0, 3, 4, 15, 16, 17, 30, 60, 100, 200, good.len() / 2, good.len() - 1]
+    a0 := parse_archive(good, "good")?
+    last := a0.offs.len() - 1
+    data_end := a0.offs[last] + a0.clens[last]
+    # Every cut before the end of the data is refused: the index says where each
+    # block ends (the search trailer after the data is optional).
+    for n in [0, 3, 4, 15, 16, 17, 30, 60, 100, 200, data_end / 2, data_end - 1]
         cut := parse_archive(good[0..n], "cut") else continue
         assert_eq(cut.files.len(), -1)
     # Flipping any index byte gives an error or a CRC failure, never a trap.
-    a0 := parse_archive(good, "good")?
     index_end := a0.offs[0]
     mut flips := 0
     for pos in 4..index_end
