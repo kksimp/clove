@@ -7,6 +7,7 @@
 MINLEN := 4
 MAXLEN := 273
 HSIZE := 262144
+BMASK := 1048575
 TOP := 16777216
 
 IS_MATCH := 0
@@ -230,7 +231,7 @@ fn depth_of(level int) int
 ## lazily with deeper searches, level 9 parses optimally (compress_opt).
 pub fn compress(d List[u8], level int) List[u8]
     if level >= 9
-        return compress_opt(d, 64)
+        return compress_opt(d, 32)
     n := d.len()
     depth := depth_of(level)
     lazy := level >= 3
@@ -567,16 +568,79 @@ fn step_state(s int, mut reps List[int], code int) int
     rep_push(mut reps, code - 4)
     after_match(s)
 
+## Level 9's match finder (LZMA's bt4): each hash bucket roots a binary tree of
+## earlier positions ordered by the bytes that follow them, so a search walks
+## only candidates sharing the longest prefix so far. Each call inserts `pos`
+## (it becomes the bucket's root) and, when `want`, writes every longer match
+## into cl/cd as (length, distance - 1) and returns how many. `cut` bounds the
+## nodes visited. Positions are stored plus one so that 0 is "none".
+fn bhash(d List[u8], pos int) int
+    v := d[pos].to_int()
+        + d[pos + 1].to_int().shl(8)
+        + d[pos + 2].to_int().shl(16)
+        + d[pos + 3].to_int().shl(24)
+    (v * 789008181).shr(30).bit_and(BMASK)
+
+fn bt_find(
+    d List[u8],
+    mut bhead List[u32],
+    mut son List[u32],
+    pos int,
+    limit int,
+    cut int,
+    want bool,
+    mut cl List[int],
+    mut cd List[int],
+) int
+    h := bhash(d, pos)
+    mut cur := bhead[h].to_int()
+    bhead[h] = (pos + 1).to_u32()
+    mut ptr0 := 2 * pos + 1
+    mut ptr1 := 2 * pos
+    mut len0 := 0
+    mut len1 := 0
+    mut best := 1
+    mut nc := 0
+    mut left := cut
+    while cur > 0 and left > 0
+        c := cur - 1
+        left -= 1
+        mut l := len0.min(len1)
+        while l < limit and d[c + l] == d[pos + l]
+            l += 1
+        if want and l > best
+            best = l
+            cl[nc] = l
+            cd[nc] = pos - c - 1
+            nc += 1
+        if l >= limit
+            son[ptr1] = son[2 * c]
+            son[ptr0] = son[2 * c + 1]
+            return nc
+        if d[c + l] < d[pos + l]
+            son[ptr1] = cur.to_u32()
+            ptr1 = 2 * c + 1
+            cur = son[ptr1].to_int()
+            len1 = l
+        else
+            son[ptr0] = cur.to_u32()
+            ptr0 = 2 * c
+            cur = son[ptr0].to_int()
+            len0 = l
+    son[ptr0] = (0).to_u32()
+    son[ptr1] = (0).to_u32()
+    nc
+
 ## Level 9: for each window of up to OPT positions, the cheapest coding by the
 ## current prices (literals, one-byte repeats, the four repeat distances and every
-## length of every match the hash chain finds), found front to back, then coded.
+## length of every match the binary tree finds), found front to back, then coded.
 ## A match of NICE bytes or more is taken as it is and ends the window. The
 ## decoder is the same as for the other levels.
 fn compress_opt(d List[u8], depth int) List[u8]
     n := d.len()
     mut e := Enc(out: [], lo: 0, rng: 4294967295, cache: 0, csize: 1, p: [1024 for _ in 0..PROBS])
-    mut head := [0 for _ in 0..HSIZE]
-    mut prev := [0 for _ in 0..n]
+    mut bhead := [(0).to_u32() for _ in 0..BMASK + 1]
+    mut son := [(0).to_u32() for _ in 0..2 * n]
     mut reps := [0, 0, 0, 0]
     mut state := 0
     mut pos := 0
@@ -614,29 +678,20 @@ fn compress_opt(d List[u8], depth int) List[u8]
                 nst[at] = step_state(nst[j0], mut nrep, fc[at])
                 for k in 0..4
                     nr[at * 4 + k] = nrep[k]
-            # matches at p0, longer each time, then p0 joins the hash chain
+            # matches at p0, longer each time; p0 joins the tree
             mut nc := 0
             if p0 + MINLEN <= n
-                limit := MAXLEN.min(n - p0)
-                mut best := 0
-                mut cand := head[hash4(d, p0)]
-                mut tries := depth
-                while cand > 0 and tries > 0
-                    c0 := cand - 1
-                    if d[c0 + best] == d[p0 + best]
-                        ml := match_len(d, c0, p0, limit)
-                        if ml > best
-                            best = ml
-                            cl[nc] = ml
-                            cd[nc] = p0 - c0 - 1
-                            nc += 1
-                            if ml >= limit
-                                break
-                    cand = prev[c0]
-                    tries -= 1
-                h := hash4(d, p0)
-                prev[p0] = head[h]
-                head[h] = p0 + 1
+                nc = bt_find(
+                    d,
+                    mut bhead,
+                    mut son,
+                    p0,
+                    MAXLEN.min(n - p0),
+                    depth,
+                    true,
+                    mut cl,
+                    mut cd,
+                )
             st := nst[at]
             ps := p0.bit_and(3)
             base := cost[at]
@@ -652,7 +707,19 @@ fn compress_opt(d List[u8], depth int) List[u8]
                 fl[at + ln] = ln
                 fc[at + ln] = dd + 4
                 for k in 1..ln
-                    ins(mut head, mut prev, d, p0 + k, n)
+                    q := p0 + k
+                    if q + MINLEN <= n
+                        nc = bt_find(
+                            d,
+                            mut bhead,
+                            mut son,
+                            q,
+                            MAXLEN.min(n - q),
+                            depth,
+                            false,
+                            mut cl,
+                            mut cd,
+                        )
                 fin = at + ln
                 at = fin
                 break
@@ -921,3 +988,15 @@ pub fn decompress(src List[u8], n int) List[u8]
         d.push((r * 11).bit_and(255).to_u8())
     c9 := compress(d, 9)
     assert_eq(decompress(c9, d.len()), d)
+
+## The binary tree on data with many equal prefixes and matches that run to the end.
+@test fn bt_finder_roundtrips_shared_prefixes()
+    mut d := List[u8]()
+    for i in 0..3000
+        d.extend("abcab".to_bytes().to_list())
+        d.push((97 + (i * 7) % 3).to_u8())
+        if i % 50 == 0
+            d.push((i % 256).to_u8())
+    for _ in 0..600
+        d.push((120).to_u8())
+    assert_eq(decompress(compress(d, 9), d.len()), d)
