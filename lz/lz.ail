@@ -681,7 +681,17 @@ fn compress_opt(d List[u8], depth int) List[u8]
             # matches at p0, longer each time; p0 joins the tree
             mut nc := 0
             if p0 + MINLEN <= n
-                nc = bt_find(d, mut bhead, mut son, p0, MAXLEN.min(n - p0), depth, true, mut cl, mut cd)
+                nc = bt_find(
+                    d,
+                    mut bhead,
+                    mut son,
+                    p0,
+                    MAXLEN.min(n - p0),
+                    depth,
+                    true,
+                    mut cl,
+                    mut cd,
+                )
             st := nst[at]
             ps := p0.bit_and(3)
             base := cost[at]
@@ -699,7 +709,17 @@ fn compress_opt(d List[u8], depth int) List[u8]
                 for k in 1..ln
                     q := p0 + k
                     if q + MINLEN <= n
-                        nc = bt_find(d, mut bhead, mut son, q, MAXLEN.min(n - q), depth, false, mut cl, mut cd)
+                        nc = bt_find(
+                            d,
+                            mut bhead,
+                            mut son,
+                            q,
+                            MAXLEN.min(n - q),
+                            depth,
+                            false,
+                            mut cl,
+                            mut cd,
+                        )
                 fin = at + ln
                 at = fin
                 break
