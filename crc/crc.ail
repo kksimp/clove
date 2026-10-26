@@ -22,12 +22,7 @@ pub fn crc32(d List[u8]) int
     mut c := 4294967295
     mut i := 0
     while i + 4 <= n
-        c = c.bit_xor(
-            d[i].to_int()
-                + d[i + 1].to_int().shl(8)
-                + d[i + 2].to_int().shl(16)
-                + d[i + 3].to_int().shl(24),
-        )
+        c = c.bit_xor(d[i].to_int() + d[i + 1].to_int().shl(8) + d[i + 2].to_int().shl(16) + d[i + 3].to_int().shl(24))
         c = t[768 + c.bit_and(255)]
             .to_int()
             .bit_xor(t[512 + c.shr(8).bit_and(255)].to_int())
