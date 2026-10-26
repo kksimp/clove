@@ -1,0 +1,42 @@
+## CRC-32 of gzip (RFC 1952, polynomial 0xEDB88320) over a byte list, four bytes
+## a step by slicing-by-4 tables. std's hash.crc32 goes bit by bit, which took
+## more than half of decode time.
+
+## Table k (entries k*256..k*256+255) advances the CRC of one byte by k more zero bytes.
+fn tables() List[u32]
+    mut t := [(0).to_u32() for _ in 0..1024]
+    for i in 0..256
+        mut c := i
+        for _ in 0..8
+            c = if c.bit_and(1) != 0 then 3988292384.bit_xor(c.shr(1)) else c.shr(1)
+        t[i] = c.to_u32()
+    for i in 0..256
+        for k in 1..4
+            p := t[(k - 1) * 256 + i].to_int()
+            t[k * 256 + i] = t[p.bit_and(255)].to_int().bit_xor(p.shr(8)).to_u32()
+    t
+
+pub fn crc32(d List[u8]) int
+    t := tables()
+    n := d.len()
+    mut c := 4294967295
+    mut i := 0
+    while i + 4 <= n
+        c = c.bit_xor(d[i].to_int() + d[i + 1].to_int().shl(8) + d[i + 2].to_int().shl(16) + d[i + 3].to_int().shl(24))
+        c = t[768 + c.bit_and(255)]
+            .to_int()
+            .bit_xor(t[512 + c.shr(8).bit_and(255)].to_int())
+            .bit_xor(t[256 + c.shr(16).bit_and(255)].to_int())
+            .bit_xor(t[c.shr(24)].to_int())
+        i += 4
+    while i < n
+        c = t[c.bit_xor(d[i].to_int()).bit_and(255)].to_int().bit_xor(c.shr(8))
+        i += 1
+    c.bit_xor(4294967295)
+
+@test fn matches_the_check_value_and_std()
+    assert_eq(crc32("123456789".to_bytes().to_list()), 3421780262)
+    mut d := List[u8]()
+    for i in 0..1003
+        d.push(((i * 131 + i / 7) % 256).to_u8())
+        assert_eq(crc32(d), hash.crc32(bytes.from_list(d)))

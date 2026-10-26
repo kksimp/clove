@@ -18,6 +18,7 @@
 ## Format: README.md. Errors carry a rule ID (`clove.format`, `clove.usage`).
 
 use cm
+use crc
 use exe
 use lz
 use search
@@ -115,8 +116,8 @@ fn pack(data bytes, bsize int, engine int) Packed
         par for i in first..last
             s := i * bsize
             raw := data[s..(s + bsize).min(data.len())]
-            crcs[i] = hash.crc32(raw)
             blk := raw.to_list()
+            crcs[i] = crc.crc32(blk)
             src := if kind == 0 then blk else exe.filter(blk, kind, true)
             c := if engine == 1 then cm.compress(src, kind) else lz.compress(
                 src,
@@ -160,7 +161,7 @@ fn decode(
         elif codec == 2
             dec = lz.decompress(comp, rawlens[i])
         raw := if kind == 0 then dec else exe.filter(dec, kind, false)
-        if raw.len() == rawlens[i] and hash.crc32(bytes.from_list(raw)) == crcs[i]
+        if raw.len() == rawlens[i] and crc.crc32(raw) == crcs[i]
             out[i] = raw
     out
 
