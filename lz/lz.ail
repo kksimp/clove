@@ -654,6 +654,8 @@ fn compress_opt(d List[u8], depth int) List[u8]
     mut lpm := [0 for _ in 0..4 * MAXLEN]
     mut lpr := [0 for _ in 0..4 * MAXLEN]
     mut dp := [0, 0, 0, 0]
+    mut dsl := [0 for _ in 0..4 * 64]
+    mut dal := [0 for _ in 0..16]
     mut nrep := [0, 0, 0, 0]
     while pos < n
         w := OPT.min(n - pos)
@@ -667,6 +669,10 @@ fn compress_opt(d List[u8], depth int) List[u8]
             for x in 0..MAXLEN - 1
                 lpm[q * MAXLEN + x] = p_mlen(e.p, LEN_MATCH, x, q)
                 lpr[q * MAXLEN + x] = p_mlen(e.p, LEN_REP, x, q)
+            for sx in 0..64
+                dsl[q * 64 + sx] = p_tree(e.p, SLOT + q * 64, 6, sx)
+        for vx in 0..16
+            dal[vx] = p_rtree(e.p, ALIGN, 4, vx)
         mut at := 0
         mut fin := w
         while at < fin
@@ -777,8 +783,20 @@ fn compress_opt(d List[u8], depth int) List[u8]
             for ci in 0..nc
                 ml2 := cl[ci].min(lim)
                 dd2 := cd[ci]
+                # p_dist for the 4 length contexts, from the window's slot and align prices
+                s2 := slot_of(dd2)
+                mut ex := 0
+                if s2 >= 4
+                    nb2 := s2.shr(1) - 1
+                    e2 := dd2 - (2 + s2.bit_and(1)).shl(nb2)
+                    ex = if nb2 > 4 then (nb2 - 4) * 16 + dal[e2.bit_and(15)] else p_rtree(
+                        e.p,
+                        SPEC + s2 * 16,
+                        nb2,
+                        e2,
+                    )
                 for x in 0..4
-                    dp[x] = p_dist(e.p, x, dd2)
+                    dp[x] = dsl[x * 64 + s2] + ex
                 for ln in (prevl + 1).max(2)..ml2 + 1
                     mc := npre + lpm[ps * MAXLEN + ln - 2] + dp[(ln - 2).min(3)]
                     if mc < cost[at + ln]
