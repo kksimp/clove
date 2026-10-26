@@ -1,7 +1,7 @@
 ## clove: an archiver written in AIL, with its own codecs: a fast LZ engine (lz/) and a
 ## context-mixing engine (cm/), chosen per block.
 ##
-##     clove.ail a [-m fast|max] [-b BLOCK_KB] ARCHIVE PATH...   add files and directories
+##     clove.ail a [-m fast|opt|max] [-b BLOCK_KB] ARCHIVE PATH... add files and directories
 ##     clove.ail x ARCHIVE [DIR]                        extract (into DIR, default .)
 ##     clove.ail l [--json] ARCHIVE                     list
 ##     clove.ail t [--json] ARCHIVE                     test: decode every block, check CRCs
@@ -11,7 +11,7 @@
 ##                                                      lines holding TEXT; the trigram index skips blocks that cannot match
 ##     clove.ail describe [--json] ARCHIVE              files, kinds, line counts, engines and the index
 ##     clove.ail serve                                  MCP server on stdin and stdout: list, describe, read, grep
-##     clove.ail bench FILE [-m fast|max] [-b BLOCK_KB]          ratio and speed, with a round-trip check
+##     clove.ail bench FILE [-m fast|opt|max] [-b BLOCK_KB]      ratio and speed, with a round-trip check
 ##
 ## Blocks are independent: they compress and decode on all cores (`par for`),
 ## and the index at the front of the archive finds any block with no scan.
@@ -33,7 +33,9 @@ MAX_SIZE := 281474976710656
 
 USAGE := """
     usage: clove COMMAND ...
-      a [-m fast|max] [-b BLOCK_KB] ARCHIVE PATH...   add (fast: LZ, 1 MB blocks; max: context mixing, 4 MB blocks)
+      a [-m fast|opt|max] [-b BLOCK_KB] ARCHIVE PATH...
+                                        add (fast: LZ, 1 MB blocks; opt: LZ parsed optimally, same
+                                        decode speed; max: context mixing, 4 MB blocks)
       x ARCHIVE [DIR]                   extract into DIR (default .)
       l [--json] ARCHIVE                list
       t [--json] ARCHIVE                test every block
@@ -43,7 +45,7 @@ USAGE := """
                                         lines holding TEXT, decoding only blocks the index lets through
       describe [--json] ARCHIVE         files, kinds, line counts, engines, index size
       serve                             MCP server on stdin/stdout (tools clove_list, clove_describe, clove_read, clove_grep)
-      bench FILE [-m fast|max] [-b BLOCK_KB]   ratio, speed and round-trip check
+      bench FILE [-m fast|opt|max] [-b BLOCK_KB]   ratio, speed and round-trip check
     """
 
 error enum CloveError
@@ -100,6 +102,7 @@ fn raw_len(size int, bsize int, i int) int
 ## Compresses `data` block by block (a block that does not shrink is stored).
 ## The engine byte: the codec in the low 4 bits (0 stored, 1 cm, 2 lz) and the
 ## executable filter in the next 2 (0 none, 1 x86-64, 2 ARM64; never on stored blocks).
+## `engine` is 1 (max: cm), 2 (fast: lz level 5) or 3 (opt: lz level 9, coded as lz).
 fn pack(data bytes, bsize int, engine int) Packed
     nb := nblocks(data.len(), bsize)
     kind := exe.detect(data)
@@ -115,14 +118,17 @@ fn pack(data bytes, bsize int, engine int) Packed
             crcs[i] = hash.crc32(raw)
             blk := raw.to_list()
             src := if kind == 0 then blk else exe.filter(blk, kind, true)
-            c := if engine == 1 then cm.compress(src, kind) else lz.compress(src, 5)
+            c := if engine == 1 then cm.compress(src, kind) else lz.compress(
+                src,
+                if engine == 3 then 9 else 5,
+            )
             parts[i] = if c.len() < blk.len() then c else blk
         for i in first..last
             all = all + bytes.from_list(parts[i])
         first = last
     clens := [q.len() for q in parts]
     engines := [
-        if clens[i] == raw_len(data.len(), bsize, i) then 0 else engine + kind.shl(4)
+        if clens[i] == raw_len(data.len(), bsize, i) then 0 else engine.min(2) + kind.shl(4)
         for i in 0..nb
     ]
     Packed(data: all, clens: clens, crcs: crcs, engines: engines)
@@ -856,8 +862,10 @@ fn parse(args List[str]) Opts ! CloveError
                 o.engine = 2
             elif word == "max"
                 o.engine = 1
+            elif word == "opt"
+                o.engine = 3
             else
-                return Usage(text: "-m is fast or max")
+                return Usage(text: "-m is fast, opt or max")
             i += 2
         elif a == "--json"
             o.json = true
