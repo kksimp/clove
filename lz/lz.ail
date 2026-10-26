@@ -505,6 +505,20 @@ fn p_mlen(p List[int], base int, l int, ps int) int
         return pb(p, base, 1) + pb(p, base + 1, 0) + p_tree(p, base + 34 + ps * 8, 3, l - 8)
     pb(p, base, 1) + pb(p, base + 1, 1) + p_tree(p, base + 66, 8, l - 16)
 
+## p_mlen for every length code x and position context ps, into
+## out[ps * MAXLEN + x]; the 8-bit high tree is priced once for all four.
+fn len_prices(p List[int], base int, mut out List[int])
+    c0 := pb(p, base, 0)
+    c1 := pb(p, base, 1) + pb(p, base + 1, 0)
+    c2 := pb(p, base, 1) + pb(p, base + 1, 1)
+    hi := [c2 + p_tree(p, base + 66, 8, v) for v in 0..256]
+    for ps in 0..4
+        for v in 0..8
+            out[ps * MAXLEN + v] = c0 + p_tree(p, base + 2 + ps * 8, 3, v)
+            out[ps * MAXLEN + 8 + v] = c1 + p_tree(p, base + 34 + ps * 8, 3, v)
+        for x in 16..MAXLEN - 1
+            out[ps * MAXLEN + x] = hi[x - 16]
+
 fn p_dist(p List[int], l int, d int) int
     s := slot_of(d)
     ctx := if l > 3 then 3 else l
@@ -665,10 +679,9 @@ fn compress_opt(d List[u8], depth int) List[u8]
         nst[0] = state
         for k in 0..4
             nr[k] = reps[k]
+        len_prices(e.p, LEN_MATCH, mut lpm)
+        len_prices(e.p, LEN_REP, mut lpr)
         for q in 0..4
-            for x in 0..MAXLEN - 1
-                lpm[q * MAXLEN + x] = p_mlen(e.p, LEN_MATCH, x, q)
-                lpr[q * MAXLEN + x] = p_mlen(e.p, LEN_REP, x, q)
             for sx in 0..64
                 dsl[q * 64 + sx] = p_tree(e.p, SLOT + q * 64, 6, sx)
         for vx in 0..16
@@ -1018,3 +1031,11 @@ pub fn decompress(src List[u8], n int) List[u8]
     for _ in 0..600
         d.push((120).to_u8())
     assert_eq(decompress(compress(d, 9), d.len()), d)
+
+@test fn len_prices_match_p_mlen()
+    p := [((i * 977) % 2000 + 24) for i in 0..PROBS]
+    mut out := [0 for _ in 0..4 * MAXLEN]
+    len_prices(p, LEN_MATCH, mut out)
+    for ps in 0..4
+        for x in 0..MAXLEN - 1
+            assert_eq(out[ps * MAXLEN + x], p_mlen(p, LEN_MATCH, x, ps))
