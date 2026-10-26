@@ -14,7 +14,6 @@
 NORD := 8
 NIN := 11
 LIMIT := 255
-MASK31 := 2147483647
 INIT := 1073741824
 
 ## squash/stretch as in the lpaq family: 12-bit probabilities, logits in -2047..2047.
@@ -76,8 +75,8 @@ fn stretch_table() List[int]
 fn delta_table() List[int]
     [131072 / (2 * n + 3) for n in 0..1024]
 
-## Table slots hold a 21-bit probability over a 10-bit hit count; the count sets
-## the learning rate (fast at first, then settling at 1/limit). See Model.adapt.
+## Table slots hold a 21-bit probability over a 10-bit hit count in a u32; the count
+## sets the learning rate (fast at first, then settling at 1/limit). See Model.adapt.
 
 fn fold(x int) int
     x.bit_xor(x.shr(32)).bit_and(268435455)
@@ -88,13 +87,13 @@ fn bits_for(n int, lo int, hi int) int
         b += 1
     b
 
-## The SSE curve of context `cx`: 33 points over the logit range.
-fn apm_init(nctx int) List[int]
-    curve := [squash((j - 16) * 128) * 16 for j in 0..33]
+## The SSE curve of context `cx`: 33 points over the logit range (0..65661, so u32).
+fn apm_init(nctx int) List[u32]
+    curve := [(squash((j - 16) * 128) * 16).to_u32() for j in 0..33]
     [curve[k % 33] for k in 0..nctx * 33]
 
 struct Model
-    t List[int]
+    t List[u32]
     tbits int
     o0 List[int]
     idx List[int]
@@ -104,10 +103,10 @@ struct Model
     wa List[int]
     wb List[int]
     msm List[int]
-    mtab List[int]
+    mtab List[u32]
     mbits int
-    a1 List[int]
-    a2 List[int]
+    a1 List[u32]
+    a2 List[u32]
     buf List[u8]
     sq List[int]
     dt List[int]
@@ -133,7 +132,7 @@ fn new_model(n int) Model
     tbits := bits_for(n * 2, 12, 21)
     mbits := bits_for(n, 10, 20)
     mut m := Model(
-        t: [INIT.shl(31) + INIT for _ in 0..NORD * (1).shl(tbits - 1)],
+        t: [INIT.to_u32() for _ in 0..NORD * (1).shl(tbits)],
         tbits: tbits,
         o0: [INIT for _ in 0..256],
         idx: [0 for _ in 0..NORD],
@@ -143,7 +142,7 @@ fn new_model(n int) Model
         wa: [16000 for _ in 0..NIN * 256],
         wb: [16000 for _ in 0..NIN * 1024],
         msm: [INIT for _ in 0..64],
-        mtab: [0 for _ in 0..(1).shl(mbits)],
+        mtab: [(0).to_u32() for _ in 0..(1).shl(mbits)],
         mbits: mbits,
         a1: apm_init(256),
         a2: apm_init(65536),
@@ -171,18 +170,8 @@ fn new_model(n int) Model
     m.set_idx()
     m
 
-## Slot j of the hashed tables: two 31-bit slots share one int.
-fn Model.slot(mut self, j int) int
-    t[j.shr(1)].shr(31 * j.bit_and(1)).bit_and(MASK31)
-
-fn Model.set_slot(mut self, j int, e int)
-    sh := 31 * j.bit_and(1)
-    w := j.shr(1)
-    old := t[w].shr(sh).bit_and(MASK31)
-    t[w] = t[w] - old.shl(sh) + e.shl(sh)
-
 ## Slots of the context models for the next bit. Each context hashes once per
-## nibble to a bucket of 16 slots (8 ints, one cache line); the bits of the
+## nibble to a bucket of 16 slots (64 bytes, one cache line); the bits of the
 ## nibble so far pick the slot, so a byte costs two cache misses per context
 ## instead of eight.
 fn Model.set_idx(mut self)
@@ -201,8 +190,8 @@ fn Model.apm(mut self, stage int, cx int, p int) int
     j := cx * 33 + s.shr(7)
     w := s.bit_and(127)
     if stage == 1
-        return (a1[j] * (128 - w) + a1[j + 1] * w).shr(11)
-    (a2[j] * (128 - w) + a2[j + 1] * w).shr(11)
+        return (a1[j].to_int() * (128 - w) + a1[j + 1].to_int() * w).shr(11)
+    (a2[j].to_int() * (128 - w) + a2[j + 1].to_int() * w).shr(11)
 
 fn Model.adapt(mut self, e int, y int, limit int) int
     n := e.bit_and(1023)
@@ -215,7 +204,7 @@ fn Model.adapt(mut self, e int, y int, limit int) int
 fn Model.predict(mut self) int
     st[0] = sq[o0[c0].shr(19)]
     for i in 0..NORD
-        st[i + 1] = sq[slot(idx[i]).shr(19)]
+        st[i + 1] = sq[t[idx[i]].to_int().shr(19)]
     mut active := 0
     st[9] = 0
     mctx = -1
@@ -263,16 +252,16 @@ fn Model.update(mut self, y int)
     near := if s.bit_and(127) < 64 then j0 else j0 + 1
     g := y.shl(16) + y.shl(7) - y - y
     j1 := i1 * 33 + near
-    a1[j1] += (g - a1[j1]) / 128
+    v1 := a1[j1].to_int()
+    a1[j1] = (v1 + (g - v1) / 128).to_u32()
     j2 := i2 * 33 + near
-    a2[j2] += (g - a2[j2]) / 128
+    v2 := a2[j2].to_int()
+    a2[j2] = (v2 + (g - v2) / 128).to_u32()
     e0 := adapt(o0[c0], y, LIMIT)
     o0[c0] = e0
     for i in 0..NORD
         j := idx[i]
-        old := slot(j)
-        upd := adapt(old, y, LIMIT)
-        set_slot(j, upd)
+        t[j] = adapt(t[j].to_int(), y, LIMIT).to_u32()
     if mctx >= 0
         em := adapt(msm[mctx], y, 1023)
         msm[mctx] = em
@@ -310,7 +299,7 @@ fn Model.end_byte(mut self, b int)
         mlen = 0
     h := (fold(c4 + c8.bit_and(255).shl(32)) * 789008181).shr(20).bit_and((1).shl(mbits) - 1)
     if mlen == 0
-        cand := mtab[h]
+        cand := mtab[h].to_int()
         if cand > 0
             mut k := 0
             while k < 32 and cand - 1 - k >= 0 and buf[cand - 1 - k] == buf[n - 1 - k]
@@ -318,7 +307,7 @@ fn Model.end_byte(mut self, b int)
             if k >= 5
                 mlen = k
                 mptr = cand
-    mtab[h] = n
+    mtab[h] = n.to_u32()
 
 struct Coder
     out List[u8]
