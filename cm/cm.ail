@@ -4,7 +4,8 @@
 ## machine produces and reads the same bytes.
 ##
 ## Per bit, eight hashed context models (orders 1-4 and 6, the current word,
-## the word pair, and a sparse context that skips a byte), a direct order-0
+## the word pair, and a sparse context that skips a byte; in machine code the two
+## word contexts become instruction contexts, see Model.end_byte), a direct order-0
 ## model and the match model each give a probability. Two mixers weigh their
 ## logits, one by the partial byte and one by the previous byte and the match
 ## state; two SSE stages refine the result by order-0 and order-1 context.
@@ -127,8 +128,10 @@ struct Model
     i1 int
     i2 int
     pr int
+    exe int
 
-fn new_model(n int) Model
+## A model for an `n`-byte block; `exe` is the block's executable filter (0 for data).
+fn new_model(n int, exe int) Model
     tbits := bits_for(n * 2, 12, 21)
     mbits := bits_for(n, 10, 20)
     mut m := Model(
@@ -166,6 +169,7 @@ fn new_model(n int) Model
         i1: 0,
         i2: 0,
         pr: 2048,
+        exe: exe,
     )
     m.set_idx()
     m
@@ -288,10 +292,17 @@ fn Model.end_byte(mut self, b int)
     hv[2] = fold(c4.bit_and(16777215) * 2246822519) + 3
     hv[3] = fold(c4.shr(16) * 2246822519 + c4.bit_and(65535) * 3266489917) + 4
     hv[4] = fold(c4.bit_xor(c8.bit_and(65535) * 2654435761)) + 5
-    hv[5] = fold(word0 * 2654435761) + 6
-    hv[6] = fold(word0.bit_xor(word1 * 1000003) * 97) + 7
-    hv[7] = fold(c4.shr(8).bit_and(65535) * 2246822519) + 8
     n := buf.len()
+    if exe == 0
+        hv[5] = fold(word0 * 2654435761) + 6
+        hv[6] = fold(word0.bit_xor(word1 * 1000003) * 97) + 7
+    else
+        # Machine code: bytes 1 and 3 back (an opcode and its operand around a
+        # ModRM byte), and the column in a 4-byte word with the bytes 4 and 8 back
+        # (the same field of the previous instructions on ARM64, table entries on x86).
+        hv[5] = fold((c4.bit_and(16711935) + 16777216) * 2654435761) + 6
+        hv[6] = fold((n.bit_and(3) + c4.shr(24).shl(2) + c8.shr(24).shl(10)) * 2246822519) + 7
+    hv[7] = fold(c4.shr(8).bit_and(65535) * 2246822519) + 8
     if mlen > 0 and buf[mptr].to_int() == b
         mlen += 1
         mptr += 1
@@ -314,9 +325,9 @@ struct Coder
     x1 int
     x2 int
 
-## Compresses `d` to a self-contained block.
-pub fn compress(d List[u8]) List[u8]
-    mut m := new_model(d.len())
+## Compresses `d` to a self-contained block; `exe` as for new_model.
+pub fn compress(d List[u8], exe int) List[u8]
+    mut m := new_model(d.len(), exe)
     mut c := Coder(out: [], x1: 0, x2: 4294967295)
     for byte in d
         b := byte.to_int()
@@ -342,8 +353,8 @@ pub fn compress(d List[u8]) List[u8]
     c.out
 
 ## Decodes `n` bytes. A damaged block gives wrong bytes, which the caller's CRC catches.
-pub fn decompress(src List[u8], n int) List[u8]
-    mut m := new_model(n)
+pub fn decompress(src List[u8], n int, exe int) List[u8]
+    mut m := new_model(n, exe)
     mut pos := 0
     mut x := 0
     for _ in 0..4
@@ -376,14 +387,15 @@ pub fn decompress(src List[u8], n int) List[u8]
     mut d := List[u8]()
     for i in 0..3000
         d.push((97 + (i * i).bit_xor(i / 7) % 5).to_u8())
-    c := compress(d)
+    c := compress(d, 0)
     assert(c.len() < d.len())
-    assert_eq(decompress(c, d.len()), d)
+    assert_eq(decompress(c, d.len(), 0), d)
+    assert_eq(decompress(compress(d, 1), d.len(), 1), d)
 
 @test fn roundtrips_tiny()
     for n in 0..5
         d := [(200).to_u8() for _ in 0..n]
-        assert_eq(decompress(compress(d), n), d)
+        assert_eq(decompress(compress(d, 0), n, 0), d)
 
 @test fn roundtrips_words_and_binary()
     text := "the quick brown fox jumps over the lazy dog; The Quick Brown Fox! ".to_bytes()
@@ -392,6 +404,6 @@ pub fn decompress(src List[u8], n int) List[u8]
         for x in text
             d.push(x)
         d.push((i * 37).bit_and(255).to_u8())
-    c := compress(d)
+    c := compress(d, 0)
     assert(c.len() * 4 < d.len())
-    assert_eq(decompress(c, d.len()), d)
+    assert_eq(decompress(c, d.len(), 0), d)

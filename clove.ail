@@ -115,7 +115,7 @@ fn pack(data bytes, bsize int, engine int) Packed
             crcs[i] = hash.crc32(raw)
             blk := raw.to_list()
             src := if kind == 0 then blk else exe.filter(blk, kind, true)
-            c := if engine == 1 then cm.compress(src) else lz.compress(src, 5)
+            c := if engine == 1 then cm.compress(src, kind) else lz.compress(src, 5)
             parts[i] = if c.len() < blk.len() then c else blk
         for i in first..last
             all = all + bytes.from_list(parts[i])
@@ -150,7 +150,7 @@ fn decode(
         codec := engines[i].bit_and(15)
         mut dec := comp
         if codec == 1
-            dec = cm.decompress(comp, rawlens[i])
+            dec = cm.decompress(comp, rawlens[i], kind)
         elif codec == 2
             dec = lz.decompress(comp, rawlens[i])
         raw := if kind == 0 then dec else exe.filter(dec, kind, false)
