@@ -23,7 +23,9 @@ use lz
 use search
 
 MAGIC := b"CLV2"
-BATCH := 8
+## Blocks per `par for`. The runtime runs a loop on the pool only when it has at least
+## twice as many iterations as cores (rt.par_worth), so this must exceed 2x any core count.
+BATCH := 64
 BLOCK_FAST := 1048576
 BLOCK_MAX := 4194304
 MAX_BLOCK := 1073741824
@@ -138,16 +140,22 @@ fn decode(
     last int,
 ) List[List[u8]]
     mut out := [List[u8]() for _ in 0..clens.len()]
+    # The body keeps to what `par for` runs on the pool (conc.par.8): no `match`, no
+    # constructor calls, and no method that changes a captured value; anything else runs
+    # the loop on one core.
     par for i in first..last
-        comp := data[offs[i]..offs[i] + clens[i]].to_list()
+        part := data[offs[i]..offs[i] + clens[i]]
+        comp := part.to_list()
         kind := engines[i].shr(4)
-        dec := match engines[i].bit_and(15)
-            0 => comp
-            1 => cm.decompress(comp, rawlens[i])
-            _ => lz.decompress(comp, rawlens[i])
+        codec := engines[i].bit_and(15)
+        mut dec := comp
+        if codec == 1
+            dec = cm.decompress(comp, rawlens[i])
+        elif codec == 2
+            dec = lz.decompress(comp, rawlens[i])
         raw := if kind == 0 then dec else exe.filter(dec, kind, false)
-        ok := raw.len() == rawlens[i] and hash.crc32(bytes.from_list(raw)) == crcs[i]
-        out[i] = if ok then raw else List[u8]()
+        if raw.len() == rawlens[i] and hash.crc32(bytes.from_list(raw)) == crcs[i]
+            out[i] = raw
     out
 
 ## Decodes and checks the given blocks, batch by batch on all cores; unless dest is "",
