@@ -118,7 +118,10 @@ fn pack(data bytes, bsize int, engine int) Packed
             crcs[i] = hash.crc32(raw)
             blk := raw.to_list()
             src := if kind == 0 then blk else exe.filter(blk, kind, true)
-            c := if engine == 1 then cm.compress(src, kind) else lz.compress(src, if engine == 3 then 9 else 5)
+            c := if engine == 1 then cm.compress(src, kind) else lz.compress(
+                src,
+                if engine == 3 then 9 else 5,
+            )
             parts[i] = if c.len() < blk.len() then c else blk
         for i in first..last
             all = all + bytes.from_list(parts[i])
