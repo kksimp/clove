@@ -226,8 +226,11 @@ fn depth_of(level int) int
         return 128
     256
 
-## Compresses `d` (bytes as ints) to a self-contained range-coded block.## Compresses `d` (bytes as ints) to a self-contained range-coded block.
+## Compresses `d` to a self-contained range-coded block; level 1-6 parse greedily or
+## lazily with deeper searches, level 9 parses optimally (compress_opt).
 pub fn compress(d List[u8], level int) List[u8]
+    if level >= 9
+        return compress_opt(d, 64)
     n := d.len()
     depth := depth_of(level)
     lazy := level >= 3
@@ -309,6 +312,291 @@ pub fn compress(d List[u8], level int) List[u8]
         e.lit(prevb, d[pos].to_int(), mb, state >= 7)
         pos += 1
         state = after_lit(state)
+    for _ in 0..5
+        e.shift_low()
+    e.out
+
+## ---- optimal parsing (level 9) ----
+## Prices in 1/16 bit of a bit whose probability is p/2048, indexed by p / 16.
+PRICE := [
+    128, 103, 91, 83, 77, 73, 69, 65, 63, 60, 58, 56, 54, 52, 50, 49,
+    47, 46, 45, 43, 42, 41, 40, 39, 38, 37, 36, 35, 35, 34, 33, 32,
+    32, 31, 30, 30, 29, 28, 28, 27, 27, 26, 25, 25, 24, 24, 23, 23,
+    22, 22, 21, 21, 21, 20, 20, 19, 19, 18, 18, 18, 17, 17, 17, 16,
+    16, 15, 15, 15, 14, 14, 14, 13, 13, 13, 12, 12, 12, 12, 11, 11,
+    11, 10, 10, 10, 10, 9, 9, 9, 9, 8, 8, 8, 7, 7, 7, 7,
+    7, 6, 6, 6, 6, 5, 5, 5, 5, 4, 4, 4, 4, 4, 3, 3,
+    3, 3, 3, 2, 2, 2, 2, 2, 1, 1, 1, 1, 1, 0, 0, 0,
+]
+OPT := 4096
+NICE := 64
+INF := 1152921504606846976
+
+fn pb(p List[int], i int, b int) int
+    if b == 0
+        return PRICE[p[i].shr(4)]
+    PRICE[(2048 - p[i]).shr(4)]
+
+fn p_tree(p List[int], base int, nbits int, v int) int
+    mut m := 1
+    mut c := 0
+    mut i := nbits - 1
+    while i >= 0
+        b := v.shr(i).bit_and(1)
+        c += pb(p, base + m, b)
+        m = m * 2 + b
+        i -= 1
+    c
+
+fn p_rtree(p List[int], base int, nbits int, v int) int
+    mut m := 1
+    mut c := 0
+    for i in 0..nbits
+        b := v.shr(i).bit_and(1)
+        c += pb(p, base + m, b)
+        m = m * 2 + b
+    c
+
+fn p_lit(p List[int], prevb int, v int, mb int, matched bool) int
+    base := LIT + prevb.shr(4) * 768
+    mut m := 1
+    mut mt := matched
+    mut c := 0
+    mut i := 7
+    while i >= 0
+        b := v.shr(i).bit_and(1)
+        if mt
+            mbit := mb.shr(i).bit_and(1)
+            c += pb(p, base + 256 + mbit * 256 + m, b)
+            if mbit != b
+                mt = false
+        else
+            c += pb(p, base + m, b)
+        m = m * 2 + b
+        i -= 1
+    c
+
+fn p_mlen(p List[int], base int, l int, ps int) int
+    if l < 8
+        return pb(p, base, 0) + p_tree(p, base + 2 + ps * 8, 3, l)
+    if l < 16
+        return pb(p, base, 1) + pb(p, base + 1, 0) + p_tree(p, base + 34 + ps * 8, 3, l - 8)
+    pb(p, base, 1) + pb(p, base + 1, 1) + p_tree(p, base + 66, 8, l - 16)
+
+fn p_dist(p List[int], l int, d int) int
+    s := slot_of(d)
+    ctx := if l > 3 then 3 else l
+    mut c := p_tree(p, SLOT + ctx * 64, 6, s)
+    if s >= 4
+        n := s.shr(1) - 1
+        e := d - (2 + s.bit_and(1)).shl(n)
+        if n > 4
+            c += (n - 4) * 16 + p_rtree(p, ALIGN, 4, e.bit_and(15))
+        else
+            c += p_rtree(p, SPEC + s * 16, n, e)
+    c
+
+## Codes one step at `pos`: a literal (code -1), a one-byte repeat (-2), repeat
+## distance `code` (0..3) or a match at distance code - 4 (distance - 1), of
+## length l. Returns the next state.
+fn Enc.emit(mut self, d List[u8], pos int, state int, mut reps List[int], code int, l int) int
+    ps := pos.bit_and(3)
+    if code == -1
+        mb := if pos > reps[0] then d[pos - reps[0] - 1].to_int() else -1
+        bit(IS_MATCH + state * 4 + ps, 0)
+        prevb := if pos > 0 then d[pos - 1].to_int() else 0
+        lit(prevb, d[pos].to_int(), mb, state >= 7)
+        return after_lit(state)
+    bit(IS_MATCH + state * 4 + ps, 1)
+    if code == -2
+        bit(IS_REP + state, 1)
+        bit(IS_G0 + state, 0)
+        bit(IS_LONG + state * 4 + ps, 0)
+        return after_short(state)
+    if code < 4
+        bit(IS_REP + state, 1)
+        if code == 0
+            bit(IS_G0 + state, 0)
+            bit(IS_LONG + state * 4 + ps, 1)
+        else
+            bit(IS_G0 + state, 1)
+            if code == 1
+                bit(IS_G1 + state, 0)
+            else
+                bit(IS_G1 + state, 1)
+                bit(IS_G2 + state, code - 2)
+            rep_front(mut reps, code)
+        mlen(LEN_REP, l - 2, ps)
+        return after_rep(state)
+    bit(IS_REP + state, 0)
+    mlen(LEN_MATCH, l - 2, ps)
+    dist(l - 2, code - 4)
+    rep_push(mut reps, code - 4)
+    after_match(state)
+
+## The state after step `code` from state s (reps are updated in place).
+fn step_state(s int, mut reps List[int], code int) int
+    if code == -1
+        return after_lit(s)
+    if code == -2
+        return after_short(s)
+    if code < 4
+        rep_front(mut reps, code)
+        return after_rep(s)
+    rep_push(mut reps, code - 4)
+    after_match(s)
+
+## Level 9: for each window of up to OPT positions, the cheapest coding by the
+## current prices (literals, one-byte repeats, the four repeat distances and every
+## length of every match the hash chain finds), found front to back, then coded.
+## A match of NICE bytes or more is taken as it is and ends the window. The
+## decoder is the same as for the other levels.
+fn compress_opt(d List[u8], depth int) List[u8]
+    n := d.len()
+    mut e := Enc(out: [], lo: 0, rng: 4294967295, cache: 0, csize: 1, p: [1024 for _ in 0..PROBS])
+    mut head := [0 for _ in 0..HSIZE]
+    mut prev := [0 for _ in 0..n]
+    mut reps := [0, 0, 0, 0]
+    mut state := 0
+    mut pos := 0
+    mut cost := [0 for _ in 0..OPT + 1]
+    mut fl := [0 for _ in 0..OPT + 1]
+    mut fc := [0 for _ in 0..OPT + 1]
+    mut nst := [0 for _ in 0..OPT + 1]
+    mut nr := [0 for _ in 0..4 * (OPT + 1)]
+    mut cl := [0 for _ in 0..MAXLEN + 1]
+    mut cd := [0 for _ in 0..MAXLEN + 1]
+    mut lpm := [0 for _ in 0..4 * MAXLEN]
+    mut lpr := [0 for _ in 0..4 * MAXLEN]
+    mut dp := [0, 0, 0, 0]
+    mut nrep := [0, 0, 0, 0]
+    while pos < n
+        w := OPT.min(n - pos)
+        for i in 0..w + 1
+            cost[i] = INF
+        cost[0] = 0
+        nst[0] = state
+        for k in 0..4
+            nr[k] = reps[k]
+        for q in 0..4
+            for x in 0..MAXLEN - 1
+                lpm[q * MAXLEN + x] = p_mlen(e.p, LEN_MATCH, x, q)
+                lpr[q * MAXLEN + x] = p_mlen(e.p, LEN_REP, x, q)
+        mut at := 0
+        mut fin := w
+        while at < fin
+            p0 := pos + at
+            if at > 0
+                j0 := at - fl[at]
+                for k in 0..4
+                    nrep[k] = nr[j0 * 4 + k]
+                nst[at] = step_state(nst[j0], mut nrep, fc[at])
+                for k in 0..4
+                    nr[at * 4 + k] = nrep[k]
+            # matches at p0, longer each time, then p0 joins the hash chain
+            mut nc := 0
+            if p0 + MINLEN <= n
+                limit := MAXLEN.min(n - p0)
+                mut best := 0
+                mut cand := head[hash4(d, p0)]
+                mut tries := depth
+                while cand > 0 and tries > 0
+                    c0 := cand - 1
+                    if d[c0 + best] == d[p0 + best]
+                        ml := match_len(d, c0, p0, limit)
+                        if ml > best
+                            best = ml
+                            cl[nc] = ml
+                            cd[nc] = p0 - c0 - 1
+                            nc += 1
+                            if ml >= limit
+                                break
+                    cand = prev[c0]
+                    tries -= 1
+                h := hash4(d, p0)
+                prev[p0] = head[h]
+                head[h] = p0 + 1
+            st := nst[at]
+            ps := p0.bit_and(3)
+            base := cost[at]
+            r0 := nr[at * 4]
+            if nc > 0 and cl[nc - 1] >= NICE and at + cl[nc - 1] <= w
+                ln := cl[nc - 1]
+                dd := cd[nc - 1]
+                cost[at + ln] = base
+                    + pb(e.p, IS_MATCH + st * 4 + ps, 1)
+                    + pb(e.p, IS_REP + st, 0)
+                    + p_mlen(e.p, LEN_MATCH, ln - 2, ps)
+                    + p_dist(e.p, ln - 2, dd)
+                fl[at + ln] = ln
+                fc[at + ln] = dd + 4
+                for k in 1..ln
+                    ins(mut head, mut prev, d, p0 + k, n)
+                fin = at + ln
+                at = fin
+                break
+            mb := if p0 > r0 then d[p0 - r0 - 1].to_int() else -1
+            prevb := if p0 > 0 then d[p0 - 1].to_int() else 0
+            lc := base + pb(e.p, IS_MATCH + st * 4 + ps, 0) + p_lit(e.p, prevb, d[p0].to_int(), mb, st >= 7)
+            if lc < cost[at + 1]
+                cost[at + 1] = lc
+                fl[at + 1] = 1
+                fc[at + 1] = -1
+            mpre := pb(e.p, IS_MATCH + st * 4 + ps, 1)
+            if mb == d[p0].to_int()
+                sc := base + mpre + pb(e.p, IS_REP + st, 1) + pb(e.p, IS_G0 + st, 0) + pb(e.p, IS_LONG + st * 4 + ps, 0)
+                if sc < cost[at + 1]
+                    cost[at + 1] = sc
+                    fl[at + 1] = 1
+                    fc[at + 1] = -2
+            lim := MAXLEN.min(n - p0).min(w - at)
+            rpre := mpre + pb(e.p, IS_REP + st, 1)
+            for k in 0..4
+                rk := nr[at * 4 + k]
+                if p0 > rk
+                    rl := match_len(d, p0 - rk - 1, p0, lim)
+                    if rl >= 2
+                        mut kp := rpre
+                        if k == 0
+                            kp += pb(e.p, IS_G0 + st, 0) + pb(e.p, IS_LONG + st * 4 + ps, 1)
+                        elif k == 1
+                            kp += pb(e.p, IS_G0 + st, 1) + pb(e.p, IS_G1 + st, 0)
+                        else
+                            kp += pb(e.p, IS_G0 + st, 1) + pb(e.p, IS_G1 + st, 1) + pb(e.p, IS_G2 + st, k - 2)
+                        b2 := base + kp
+                        for ln in 2..rl + 1
+                            rc := b2 + lpr[ps * MAXLEN + ln - 2]
+                            if rc < cost[at + ln]
+                                cost[at + ln] = rc
+                                fl[at + ln] = ln
+                                fc[at + ln] = k
+            npre := base + mpre + pb(e.p, IS_REP + st, 0)
+            mut prevl := 1
+            for ci in 0..nc
+                ml2 := cl[ci].min(lim)
+                dd2 := cd[ci]
+                for x in 0..4
+                    dp[x] = p_dist(e.p, x, dd2)
+                for ln in (prevl + 1).max(2)..ml2 + 1
+                    mc := npre + lpm[ps * MAXLEN + ln - 2] + dp[(ln - 2).min(3)]
+                    if mc < cost[at + ln]
+                        cost[at + ln] = mc
+                        fl[at + ln] = ln
+                        fc[at + ln] = dd2 + 4
+                prevl = prevl.max(ml2)
+            at += 1
+        # walk back from the end of the window, then code the steps in order
+        mut steps := List[int]()
+        mut j := at
+        while j > 0
+            steps.push(j)
+            j -= fl[j]
+        mut si := steps.len() - 1
+        while si >= 0
+            tj := steps[si]
+            state = e.emit(d, pos + tj - fl[tj], state, mut reps, fc[tj], fl[tj])
+            si -= 1
+        pos += at
     for _ in 0..5
         e.shift_low()
     e.out
@@ -462,7 +750,7 @@ pub fn decompress(src List[u8], n int) List[u8]
     mut d := List[u8]()
     for i in 0..3000
         d.push((97 + (i * i).bit_xor(i / 7) % 5).to_u8())
-    for level in 1..=6
+    for level in [1, 3, 5, 6, 9]
         c := compress(d, level)
         assert(c.len() < d.len())
         assert_eq(decompress(c, d.len()), d)
@@ -471,6 +759,7 @@ pub fn decompress(src List[u8], n int) List[u8]
     for n in 0..9
         d := [(7).to_u8() for _ in 0..n]
         assert_eq(decompress(compress(d, 5), n), d)
+        assert_eq(decompress(compress(d, 9), n), d)
 
 @test fn roundtrips_repeat_distances()
     words := [
@@ -483,5 +772,17 @@ pub fn decompress(src List[u8], n int) List[u8]
         d.extend(words[(i * 7 + i / 3) % 3])
         d.push((32 + i % 2).to_u8())
         d.push(((i * 31) % 256).to_u8())
-    for level in [1, 5]
+    for level in [1, 5, 9]
         assert_eq(decompress(compress(d, level), d.len()), d)
+
+## Level 9 across several windows, with matches past NICE that end a window.
+@test fn optimal_parse_roundtrips_long_matches()
+    mut d := List[u8]()
+    for i in 0..300
+        d.push(((i * 37 + i / 5) % 251).to_u8())
+    for r in 0..40
+        for i in 0..300
+            d.push(d[i + r % 3])
+        d.push((r * 11).bit_and(255).to_u8())
+    c9 := compress(d, 9)
+    assert_eq(decompress(c9, d.len()), d)
