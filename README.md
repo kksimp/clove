@@ -30,7 +30,7 @@ is cut into independent blocks.
 "CLV3" | u32 entry count | u32 block count | u32 block size | u64 stream length
 per entry: u16 name length | name (UTF-8, relative, no "..") | u8 kind (0 file, 1 directory, 2 link) | u64 size
            | u32 mode | u64 modified ms | u32 newlines before the entry in its first block | u32 newlines in it
-per block: u64 offset into the data | u32 packed length | u32 CRC32 of the raw block | u8 engine: low 4 bits codec (0 stored, 1 cm, 2 lz), next 2 bits executable filter (0 none, 1 x86-64, 2 ARM64)
+per block: u64 offset into the data | u32 packed length | u32 CRC32 of the raw block | u8 engine: low 4 bits codec (0 stored, 1 cm, 2 lz, 3 fast), next 2 bits executable filter (0 none, 1 x86-64, 2 ARM64)
 data: the packed blocks, in order
 ```
 
@@ -83,6 +83,14 @@ so no earlier block is decoded.
 
 - `clove.usage`: a command line the tool can't act on; the message says what is missing.
 - `clove.format`: the archive is not CLV2, is truncated, or a block fails its CRC.
+
+## The fast engine (`fast/fast.ail`)
+
+LZ77 (hash chain, one-step lazy matching, 1 MB window) and canonical Huffman codes over a
+little-endian bit stream: one alphabet of 289 symbols for literals, end of block and match
+lengths, one of 42 for distance slots, code lengths at most 12 bits so a 4096-entry table
+decodes any symbol in one lookup. The block starts with the 331 code lengths as nibbles.
+It is the default engine (`-m fast`); `-m lz` is the range-coded LZ with a greedy parse.
 
 ## The codec (`cm/cm.ail`; the code is the spec)
 

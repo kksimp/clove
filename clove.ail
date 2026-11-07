@@ -20,6 +20,7 @@
 use cm
 use crc
 use exe
+use fast
 use lz
 use probe
 use search
@@ -39,8 +40,8 @@ BLOCK_ENT := 17
 USAGE := """
     usage: clove COMMAND ...
       a [-m fast|opt|max] [-b BLOCK_KB] ARCHIVE PATH...
-                                        add (fast: LZ, 1 MB blocks; opt: LZ parsed optimally, same
-                                        decode speed; max: context mixing, 4 MB blocks)
+                                        add (fast: LZ + Huffman, 1 MB blocks; opt: LZ parsed
+                                        optimally, range coded; max: context mixing, 4 MB blocks)
       x ARCHIVE [DIR]                   extract into DIR (default .)
       l [--json] ARCHIVE                list
       t [--json] ARCHIVE                test every block
@@ -110,6 +111,10 @@ fn rd(b bytes, pos int, nbytes int) int ! CloveError
         v += b[pos + i].to_int().shl(8 * i)
     v
 
+## The codec byte of an engine: cm 1, lz 2 (levels 5 and 9), fast 3.
+fn codec_of(engine int) int
+    if engine == 1 then 1 else if engine == 4 then 3 else 2
+
 fn nblocks(size int, bsize int) int
     (size + bsize - 1) / bsize
 
@@ -118,9 +123,9 @@ fn raw_len(size int, bsize int, i int) int
 
 ## Compresses `data` block by block (a block that looks incompressible, probe.ail,
 ## or that does not shrink, is stored) and builds each block's search entry.
-## The engine byte: the codec in the low 4 bits (0 stored, 1 cm, 2 lz) and the
+## The engine byte: the codec in the low 4 bits (0 stored, 1 cm, 2 lz, 3 fast) and the
 ## executable filter in the next 2 (0 none, 1 x86-64, 2 ARM64; never on stored blocks).
-## `engine` is 1 (max: cm), 2 (fast: lz level 5) or 3 (opt: lz level 9, coded as lz).
+## `engine` is 1 (max: cm), 2 (lz level 5), 3 (opt: lz level 9, coded as lz) or 4 (fast).
 ## `kinds[i]` is the executable filter for block i (the kind of the file at its first byte).
 fn pack(data bytes, bsize int, engine int, kinds List[int]) Packed
     nb := nblocks(data.len(), bsize)
@@ -143,17 +148,20 @@ fn pack(data bytes, bsize int, engine int, kinds List[int]) Packed
                 parts[i] = blk
             else
                 src := if kind == 0 then blk else exe.filter(blk, kind, true)
-                c := if engine == 1 then cm.compress(src, kind) else lz.compress(
-                    src,
-                    if engine == 3 then 9 else 5,
-                )
+                mut c := src
+                if engine == 1
+                    c = cm.compress(src, kind)
+                elif engine == 4
+                    c = fast.compress(src, 8)
+                else
+                    c = lz.compress(src, if engine == 3 then 9 else 5)
                 parts[i] = if c.len() < blk.len() then c else blk
         for i in first..last
             all = all + bytes.from_list(parts[i])
         first = last
     clens := [q.len() for q in parts]
     engines := [
-        if clens[i] == raw_len(data.len(), bsize, i) then 0 else engine.min(2) + kinds[i].shl(4)
+        if clens[i] == raw_len(data.len(), bsize, i) then 0 else codec_of(engine) + kinds[i].shl(4)
         for i in 0..nb
     ]
     mut index := List[int]()
@@ -189,6 +197,8 @@ fn decode(
             dec = cm.decompress(comp, rawlens[i], kind)
         elif codec == 2
             dec = lz.decompress(comp, rawlens[i])
+        elif codec == 3
+            dec = fast.decompress(comp, rawlens[i])
         raw := if kind == 0 then dec else exe.filter(dec, kind, false)
         if raw.len() == rawlens[i] and crc.crc32(raw) == crcs[i]
             out[i] = raw
@@ -288,7 +298,7 @@ fn parse_archive(b bytes, path str) Archive ! CloveError
         if rel != next
             return Bad(why: "block {k} is not where the index says")
         codec := eng.bit_and(15)
-        if codec > 2
+        if codec > 3
             or eng.shr(4) > 2
             or (codec == 0 and eng != 0)
             or clen < 1
@@ -812,12 +822,11 @@ fn kind_of(ix search.Index, a Archive, f FileEnt) str
         return "binary"
     "mixed"
 
-## The engines of the blocks a file lies in: stored, cm, lz counts.
+## The engines of the blocks a file lies in: stored, cm, lz, fast counts.
 fn engines_of(a Archive, f FileEnt) List[int]
-    mut n := [0, 0, 0]
+    mut n := [0, 0, 0, 0]
     for g in first_block(f, a.bsize)..end_block(f, a.bsize)
-        c := a.engines[g].bit_and(15)
-        n[c.min(2)] += 1
+        n[a.engines[g].bit_and(15)] += 1
     n
 
 ## One JSON object that tells an agent what is inside before it reads anything.
@@ -832,7 +841,7 @@ fn describe_json(archive str) str ! CloveError | fs.IoError
         c := packed_of(a, f)
         size += f.size
         packed += c
-        items.push("\{\"name\": {js(f.name)}, \"kind\": \"{kind_name(f.kind)}\", \"size\": {f.size}, \"packed\": {c}, \"content\": \"{kind_of(ix, a, f)}\", \"newlines\": {f.nls}, \"modified_ms\": {f.mtime}, \"engines\": \{\"stored\": {en[0]}, \"cm\": {en[1]}, \"lz\": {en[2]}}}")
+        items.push("\{\"name\": {js(f.name)}, \"kind\": \"{kind_name(f.kind)}\", \"size\": {f.size}, \"packed\": {c}, \"content\": \"{kind_of(ix, a, f)}\", \"newlines\": {f.nls}, \"modified_ms\": {f.mtime}, \"engines\": \{\"stored\": {en[0]}, \"cm\": {en[1]}, \"lz\": {en[2]}, \"fast\": {en[3]}}}")
     mut index_bytes := 0
     if ix.ok
         for k in ix.ks
@@ -1000,6 +1009,128 @@ fn cmd_bench(path str, bsize int, engine int) ! CloveError | fs.IoError
     print("decompress {t2 - t1} ms  {mb_per_s(data.len(), t2 - t1)} MB/s")
     print("verified: every block decoded and matched its CRC")
 
+struct Opts
+    bsize int
+    engine int
+    json bool
+    lo int
+    hi int
+    out str
+    fold bool
+    binary bool
+    max int
+    only str
+    words List[str]
+
+fn parse(args List[str]) Opts ! CloveError
+    mut o := Opts(
+        bsize: 0,
+        engine: 4,
+        json: false,
+        lo: 0,
+        hi: -1,
+        out: "",
+        fold: false,
+        binary: false,
+        max: 200,
+        only: "",
+        words: [],
+    )
+    mut i := 0
+    while i < args.len()
+        a := args[i]
+        word := if i + 1 < args.len() then args[i + 1] else ""
+        if a == "-b"
+            n := word.to_int() else return Usage(text: "-b needs a number of KB")
+            o.bsize = n * 1024
+            i += 2
+        elif a == "-m"
+            if word == "fast"
+                o.engine = 4
+            elif word == "lz"
+                o.engine = 2
+            elif word == "max"
+                o.engine = 1
+            elif word == "opt"
+                o.engine = 3
+            else
+                return Usage(text: "-m is fast, lz, opt or max")
+            i += 2
+        elif a == "--json"
+            o.json = true
+            i += 1
+        elif a == "--out"
+            o.out = word
+            i += 2
+        elif a == "-i"
+            o.fold = true
+            i += 1
+        elif a == "-a"
+            o.binary = true
+            i += 1
+        elif a == "--max"
+            o.max = word.to_int() else return Usage(text: "--max needs a number")
+            i += 2
+        elif a == "--file"
+            o.only = word
+            i += 2
+        elif a == "--range"
+            ends := word.split(":")
+            if ends.len() != 2
+                return Usage(text: "--range needs A:B")
+            o.lo = ends[0].to_int() else return Usage(text: "--range needs numbers")
+            o.hi = -1
+            if ends[1] != ""
+                o.hi = ends[1].to_int() else return Usage(text: "--range needs numbers")
+            i += 2
+        else
+            o.words.push(a)
+            i += 1
+    if o.bsize == 0
+        o.bsize = if o.engine == 1 then BLOCK_MAX else BLOCK_FAST
+    if o.bsize < 4096 or o.bsize > MAX_BLOCK
+        return Usage(text: "the block is 4 KB to 1 GB")
+    o
+
+fn require(w List[str], n int, what str) ! CloveError
+    if w.len() < n
+        return Usage(text: what)
+
+fn main() !
+    args := env.args()
+    if args.len() < 1
+        print(USAGE)
+        return
+    o := parse(args[1..])?
+    w := o.words
+    match args[0]
+        "a" =>
+            require(w, 2, "a needs ARCHIVE and PATH...")?
+            cmd_add(w[0], w[1..], o.bsize, o.engine)?
+        "x" =>
+            require(w, 1, "x needs ARCHIVE")?
+            cmd_extract(w[0], if w.len() > 1 then w[1] else ".")?
+        "l" =>
+            require(w, 1, "l needs ARCHIVE")?
+            cmd_list(w[0], o.json)?
+        "t" =>
+            require(w, 1, "t needs ARCHIVE")?
+            cmd_test(w[0], o.json)?
+        "read" =>
+            require(w, 2, "read needs ARCHIVE and FILE")?
+            cmd_read(w[0], w[1], o.lo, o.hi, o.out)?
+        "grep" =>
+            require(w, 2, "grep needs ARCHIVE and TEXT")?
+            cmd_grep(w[0], w[1], o)?
+        "describe" =>
+            require(w, 1, "describe needs ARCHIVE")?
+            cmd_describe(w[0], o.json)?
+        "serve" => cmd_serve()
+        "bench" =>
+            require(w, 1, "bench needs FILE")?
+            cmd_bench(w[0], o.bsize, o.engine)?
+        _ => print(USAGE)
+
 ## Archive-level tests. They write under target/clove-test (git-ignored).
 
 TEST_DIR := "target/clove-test"
@@ -1025,7 +1156,7 @@ fn same_file(a str, b str) bool ! fs.IoError
     fs.read_bytes(a)? == fs.read_bytes(b)?
 
 @test fn add_extract_round_trip_both_engines()
-    for engine in [2, 1]
+    for engine in [4, 2, 1]
         root := "{TEST_DIR}/rt{engine}"
         make_tree("{root}/in")?
         arc := "{root}/t.clove"
@@ -1141,7 +1272,7 @@ fn same_file(a str, b str) bool ! fs.IoError
         ])
         prog.extend(test_bytes(3, k).to_list())
     fs.write_bytes("{root}/prog", bytes.from_list(prog))?
-    for engine in [2, 1]
+    for engine in [4, 2, 1]
         arc := "{root}/p{engine}.clove"
         cmd_add(arc, ["{root}/prog"], 4096, engine)?
         a := parse_archive(fs.read_bytes(arc)?, arc)?
