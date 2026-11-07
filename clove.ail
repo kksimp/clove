@@ -21,6 +21,7 @@ use cm
 use crc
 use exe
 use lz
+use probe
 use search
 
 MAGIC := b"CLV2"
@@ -100,7 +101,8 @@ fn nblocks(size int, bsize int) int
 fn raw_len(size int, bsize int, i int) int
     bsize.min(size - i * bsize)
 
-## Compresses `data` block by block (a block that does not shrink is stored).
+## Compresses `data` block by block (a block that looks incompressible, probe.ail,
+## or that does not shrink, is stored).
 ## The engine byte: the codec in the low 4 bits (0 stored, 1 cm, 2 lz) and the
 ## executable filter in the next 2 (0 none, 1 x86-64, 2 ARM64; never on stored blocks).
 ## `engine` is 1 (max: cm), 2 (fast: lz level 5) or 3 (opt: lz level 9, coded as lz).
@@ -118,12 +120,15 @@ fn pack(data bytes, bsize int, engine int) Packed
             raw := data[s..(s + bsize).min(data.len())]
             blk := raw.to_list()
             crcs[i] = crc.crc32(blk)
-            src := if kind == 0 then blk else exe.filter(blk, kind, true)
-            c := if engine == 1 then cm.compress(src, kind) else lz.compress(
-                src,
-                if engine == 3 then 9 else 5,
-            )
-            parts[i] = if c.len() < blk.len() then c else blk
+            if probe.incompressible(blk)
+                parts[i] = blk
+            else
+                src := if kind == 0 then blk else exe.filter(blk, kind, true)
+                c := if engine == 1 then cm.compress(src, kind) else lz.compress(
+                    src,
+                    if engine == 3 then 9 else 5,
+                )
+                parts[i] = if c.len() < blk.len() then c else blk
         for i in first..last
             all = all + bytes.from_list(parts[i])
         first = last
