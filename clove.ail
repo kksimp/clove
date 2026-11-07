@@ -21,6 +21,7 @@ use cm
 use crc
 use exe
 use lz
+use probe
 use search
 
 MAGIC := b"CLV3"
