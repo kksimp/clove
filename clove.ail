@@ -1000,6 +1000,126 @@ fn cmd_bench(path str, bsize int, engine int) ! CloveError | fs.IoError
     print("decompress {t2 - t1} ms  {mb_per_s(data.len(), t2 - t1)} MB/s")
     print("verified: every block decoded and matched its CRC")
 
+struct Opts
+    bsize int
+    engine int
+    json bool
+    lo int
+    hi int
+    out str
+    fold bool
+    binary bool
+    max int
+    only str
+    words List[str]
+
+fn parse(args List[str]) Opts ! CloveError
+    mut o := Opts(
+        bsize: 0,
+        engine: 2,
+        json: false,
+        lo: 0,
+        hi: -1,
+        out: "",
+        fold: false,
+        binary: false,
+        max: 200,
+        only: "",
+        words: [],
+    )
+    mut i := 0
+    while i < args.len()
+        a := args[i]
+        word := if i + 1 < args.len() then args[i + 1] else ""
+        if a == "-b"
+            n := word.to_int() else return Usage(text: "-b needs a number of KB")
+            o.bsize = n * 1024
+            i += 2
+        elif a == "-m"
+            if word == "fast"
+                o.engine = 2
+            elif word == "max"
+                o.engine = 1
+            elif word == "opt"
+                o.engine = 3
+            else
+                return Usage(text: "-m is fast, opt or max")
+            i += 2
+        elif a == "--json"
+            o.json = true
+            i += 1
+        elif a == "--out"
+            o.out = word
+            i += 2
+        elif a == "-i"
+            o.fold = true
+            i += 1
+        elif a == "-a"
+            o.binary = true
+            i += 1
+        elif a == "--max"
+            o.max = word.to_int() else return Usage(text: "--max needs a number")
+            i += 2
+        elif a == "--file"
+            o.only = word
+            i += 2
+        elif a == "--range"
+            ends := word.split(":")
+            if ends.len() != 2
+                return Usage(text: "--range needs A:B")
+            o.lo = ends[0].to_int() else return Usage(text: "--range needs numbers")
+            o.hi = -1
+            if ends[1] != ""
+                o.hi = ends[1].to_int() else return Usage(text: "--range needs numbers")
+            i += 2
+        else
+            o.words.push(a)
+            i += 1
+    if o.bsize == 0
+        o.bsize = if o.engine == 1 then BLOCK_MAX else BLOCK_FAST
+    if o.bsize < 4096 or o.bsize > MAX_BLOCK
+        return Usage(text: "the block is 4 KB to 1 GB")
+    o
+
+fn require(w List[str], n int, what str) ! CloveError
+    if w.len() < n
+        return Usage(text: what)
+
+fn main() !
+    args := env.args()
+    if args.len() < 1
+        print(USAGE)
+        return
+    o := parse(args[1..])?
+    w := o.words
+    match args[0]
+        "a" =>
+            require(w, 2, "a needs ARCHIVE and PATH...")?
+            cmd_add(w[0], w[1..], o.bsize, o.engine)?
+        "x" =>
+            require(w, 1, "x needs ARCHIVE")?
+            cmd_extract(w[0], if w.len() > 1 then w[1] else ".")?
+        "l" =>
+            require(w, 1, "l needs ARCHIVE")?
+            cmd_list(w[0], o.json)?
+        "t" =>
+            require(w, 1, "t needs ARCHIVE")?
+            cmd_test(w[0], o.json)?
+        "read" =>
+            require(w, 2, "read needs ARCHIVE and FILE")?
+            cmd_read(w[0], w[1], o.lo, o.hi, o.out)?
+        "grep" =>
+            require(w, 2, "grep needs ARCHIVE and TEXT")?
+            cmd_grep(w[0], w[1], o)?
+        "describe" =>
+            require(w, 1, "describe needs ARCHIVE")?
+            cmd_describe(w[0], o.json)?
+        "serve" => cmd_serve()
+        "bench" =>
+            require(w, 1, "bench needs FILE")?
+            cmd_bench(w[0], o.bsize, o.engine)?
+        _ => print(USAGE)
+
 ## Archive-level tests. They write under target/clove-test (git-ignored).
 
 TEST_DIR := "target/clove-test"
