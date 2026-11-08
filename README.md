@@ -94,11 +94,17 @@ It is the default engine (`-m fast`); `-m lz` is the range-coded LZ with a greed
 
 ## The codec (`cm/cm.ail`; the code is the spec)
 
-- Models: order 0, 1, 2, 3, 4 and 6 context tables of adaptive probabilities (22-bit
-  probability plus a hit count that sets the learning rate), and a match model that
-  follows the longest recent repeat of the last 5 bytes and predicts its next bit.
-- Mixer: logistic mixing of the models' logits; weight sets chosen by the partial byte
-  and whether a match is active; online gradient learning.
+- Models: order 1, 2, 3, 4 and 6, word, word-pair and sparse hashed contexts (instruction
+  contexts in machine code), each slot a bit history (a state of a 175-state machine:
+  zeros seen, ones seen, last bit; old evidence halves), mapped to a probability by an
+  adaptive table per order; a direct order-0 model; and a match model that follows the
+  longest recent repeat of the last 5 bytes and predicts its next bit. Nibble buckets of
+  16 slots with a check word, so a hash collision clears a bucket instead of mixing contexts.
+- Mixer: two logistic mixers over 19 inputs (each history's logit and linear lean, the
+  order-0 and match predictions, a bias), weight sets chosen by the partial byte and by the
+  previous byte with the match state; a final two-weight mixer per bit position joins them;
+  online gradient learning.
+- SSE: two stages by order-0 and order-1 context.
 - Coder: carry-less 32-bit binary arithmetic coder, 12-bit probabilities.
-- Not yet: SSE/APM stages, word and sparse contexts, a second mixer layer, per-file
+- Not yet: a shared learned prior across blocks, a second mixer layer by context, per-file
   type detection.
