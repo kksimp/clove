@@ -1171,7 +1171,7 @@ fn same_file(a str, b str) bool ! fs.IoError
     for k in 0..20
         mut text := ""
         for l in 0..30
-            text = text + "file {k} line {l} {if l == k then "needle" else "hay"}\n"
+            text = "{text}file {k} line {l} {if l == k then "needle" else "hay"}\n"
         fs.write_text("{root}/in/f{k:0>2}.txt", text)?
     arc := "{root}/t.clove"
     cmd_add(arc, ["{root}/in"], 4096, 2)?
