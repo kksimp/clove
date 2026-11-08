@@ -1138,8 +1138,8 @@ fn parse(args List[str]) Opts ! CloveError
             if ends[1] != ""
                 o.hi = ends[1].to_int() else return Usage(text: "--range needs numbers")
             i += 2
-        elif a.len() == 2 and a.starts_with("-") and a.slice(1, 2) >= "1" and a.slice(1, 2) <= "9"
-            lvl := a.slice(1, 2).to_int() else 5
+        elif a.len() == 2 and a.starts_with("-") and a.chars()[1].code() >= 49 and a.chars()[1].code() <= 57
+            lvl := a.chars()[1].code() - 48
             o.engine = if lvl <= 3 then 4 else if lvl <= 7 then 3 else 1
             i += 1
         else
