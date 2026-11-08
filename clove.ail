@@ -1330,7 +1330,7 @@ fn same_file(a str, b str) bool ! fs.IoError
         mut text := ""
         for l in 0..30
             text = text + "file {k} line {l} {if l == k then "needle" else "hay"}\n"
-        fs.write_text("{root}/in/f{k:02}.txt", text)?
+        fs.write_text("{root}/in/f{k:0>2}.txt", text)?
     arc := "{root}/t.clove"
     cmd_add(arc, ["{root}/in"], 4096, 2)?
     a := load_archive(arc)?
@@ -1343,7 +1343,7 @@ fn same_file(a str, b str) bool ! fs.IoError
         assert(h.text.contains("file {k} line {k} needle"))
     cmd_extract(arc, "{root}/out")?
     for k in 0..20
-        assert(same_file("{root}/in/f{k:02}.txt", "{root}/out/{root}/in/f{k:02}.txt")?)
+        assert(same_file("{root}/in/f{k:0>2}.txt", "{root}/out/{root}/in/f{k:0>2}.txt")?)
     one := read_part(arc, "{root}/in/f07.txt", 7, 20)?
     assert_eq(one.text(), fs.read_text("{root}/in/f07.txt")?.slice(7, 20))
 
