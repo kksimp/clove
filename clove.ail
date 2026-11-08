@@ -1223,11 +1223,17 @@ fn same_file(a str, b str) bool ! fs.IoError
     a0 := parse_archive(good, "good")?
     last := a0.offs.len() - 1
     data_end := a0.offs[last] + a0.clens[last]
-    # Every cut before the end of the data is refused: the index says where each
-    # block ends (the search trailer after the data is optional).
-    for n in [0, 3, 4, 15, 16, 17, 30, 60, 100, 200, data_end / 2, data_end - 1]
-        cut := parse_archive(good[0..n], "cut") else continue
-        assert_eq(cut.files.len(), -1)
+    # A cut inside the index is refused by the parser; a cut inside the data parses
+    # (the index is read alone) and `t` reports the damage (the trailer is optional).
+    index_end0 := a0.offs[0]
+    for n in [0, 3, 4, 15, 16, 17, 30, 60, 100, 200, index_end0 - 1]
+        if n < index_end0
+            cut := parse_archive(good[0..n], "cut") else continue
+            assert_eq(cut.files.len(), -1)
+    for n in [index_end0, data_end / 2, data_end - 1]
+        fs.write_bytes("{root}/cut.clove", good[0..n])?
+        cmd_test("{root}/cut.clove", false) else continue
+        assert(false)
     # Flipping any index byte gives an error or a CRC failure, never a trap.
     index_end := a0.offs[0]
     mut flips := 0
