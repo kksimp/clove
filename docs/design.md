@@ -1,19 +1,32 @@
 # Clove design note (draft 2026-10-25)
 
-## Status (2026-10-25)
+## Status (2026-11-08)
 
 | Part | State |
 |---|---|
-| CLV2 container: index at the front, independent blocks, CRC32 per block | implemented |
-| Engine `fast` (LZ77 + LZMA-style range-coded model) | implemented; ratio below 7-Zip's |
-| Engine `max` (context mixing: 8 hashed contexts, match model, 2 mixers, 2 SSE) | implemented; 8.7% below 7z -mx9 on enwik8 (20 MB), far slower |
-| `a`, `x`, `l`, `t`, `bench`, `read --range`, `--json` on `l` and `t`, rule IDs in errors | implemented |
-| Validated index parsing, path-safety rules, archive-level tests | implemented |
-| `grep`, `describe`, trigram index, MCP `serve` | in progress (separate branch) |
-| 4 KB-aligned blocks | planned, not built |
-| Shared learned prior | planned, not built |
-| Per-block automatic engine choice | planned (the engine byte exists; the writer uses `-m`) |
-| Executable filters and instruction contexts; deflate-inside recompression | planned |
+| CLV3 container: index at the front, one solid stream, independent blocks, CRC32 per block, per-entry kind, mode, time and newline counts | on branch `solid` (job CLOVE24) |
+| Engine `fast` (LZ77 + canonical Huffman, byte-aligned bit stream, 12-bit tables) | on branch `fast-engine` (job CLOVE25) |
+| Engine `lz` / `opt` (LZ77 + LZMA-style range coder; `opt` parses optimally with a binary tree) | implemented; `opt` ties 7z -mx9 on text, beats it on executables |
+| Engine `max` (context mixing: 8 hashed contexts, match model, 2 mixers, 2 SSE, instruction contexts for executables) | implemented; 8-30% smaller than xz -9e; about 0.7 MB/s on 3 cores |
+| Incompressible blocks stored without coding (`probe/`) | on branch `store-probe` (job CLOVE23) |
+| `a`, `x`, `l`, `t`, `read --range`, `grep` with the trigram trailer, `describe`, MCP `serve`, `bench`, `--json`, rule IDs in errors | implemented |
+| Streamed add and extract (one batch of blocks in memory) | on branch `solid` |
+| `x --in-place`, modes, times and links restored | on branch `attrs`; waits for AIL ADR 0977 (`std.fs` attribute calls) and a new pin |
+| Executable filters (x86-64, ARM64 branch targets) | implemented |
+| Deflate-inside recompression; shared learned prior; per-block automatic engine choice | planned |
+
+## In-place extraction (Kaleb, 2026-11-07)
+
+A zip or 7z archive must stay whole until the last file is out: its directory is at the
+end and its streams decode front to back, so extracting needs the archive plus the whole
+output on disk. Clove's index is at the front and every block is independent, so
+`x --in-place` decodes from the **last** block backwards: each block's bytes go to the
+files they belong to at their own offsets (`fs.write_at`; a file touched first by its tail
+is created at full length, sparse where the file system allows), then the archive is cut
+to the start of that block (`fs.truncate`). The space needed beyond the output is one
+block (1-4 MB) plus the index. A stopped run leaves a shorter archive whose index still
+describes every block; running again extracts the blocks it still holds and the files
+written earlier are untouched where they were already right.
 
 Everything below "The design" describes the target; the table says what exists.
 
