@@ -228,7 +228,7 @@ fn load_archive(path str) Archive ! CloveError | fs.IoError
             want = want * 4
             continue
         return a
-    Bad(why: "unreachable")
+    return Bad(why: "unreachable")
 
 fn parse_archive(b bytes, path str) Archive ! CloveError
     if b.len() < HEAD or b[0..4] != MAGIC
@@ -466,7 +466,8 @@ fn cmd_add(archive str, paths List[str], bsize int, engine int) ! CloveError | f
     )
     mut ents := List[FileEnt]()
     for it in items
-        mut f := FileEnt(name: it.name, kind: it.kind, size: it.size, off: w.pos, mode: 0, mtime: it.mtime, nl0: w.nl_run, nls: 0)
+        nl0 := if w.pos % bsize == 0 then 0 else w.nl_run
+        mut f := FileEnt(name: it.name, kind: it.kind, size: it.size, off: w.pos, mode: 0, mtime: it.mtime, nl0: nl0, nls: 0)
         if it.kind == 0
             mut done := 0
             mut kind := 0
