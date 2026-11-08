@@ -217,7 +217,10 @@ fn part_of(archive str, lo int, hi int) bytes ! fs.IoError
 fn batch_decode(archive str, a Archive, lo int, hi int) List[List[u8]] ! CloveError | fs.IoError
     rl := rawlens_of(a.total, a.bsize)
     base := a.offs[lo]
-    data := part_of(archive, base, a.offs[hi - 1] + a.clens[hi - 1])?
+    end := a.offs[hi - 1] + a.clens[hi - 1]
+    data := part_of(archive, base, end)?
+    if data.len() < end - base
+        return Bad(why: "the archive ends inside block {hi - 1}")
     out := decode(data, base, a.offs, a.clens, a.engines, a.crcs, rl, lo, hi)
     for i in lo..hi
         if out[i].len() != rl[i]
@@ -733,10 +736,14 @@ fn run_grep(
             for t in 0..need.len()
                 at[need[t]] = t
             rl := [raw_len(a.total, a.bsize, first + j) for j in need]
-            data := part_of(archive, a.offs[first + need[0]], a.offs[first + need[need.len() - 1]] + a.clens[first + need[need.len() - 1]])?
+            gbase := a.offs[first + need[0]]
+            gend := a.offs[first + need[need.len() - 1]] + a.clens[first + need[need.len() - 1]]
+            data := part_of(archive, gbase, gend)?
+            if data.len() < gend - gbase
+                return Bad(why: "the archive ends inside block {first + need[need.len() - 1]}")
             got := decode(
                 data,
-                a.offs[first + need[0]],
+                gbase,
                 [a.offs[first + j] for j in need],
                 [a.clens[first + j] for j in need],
                 [a.engines[first + j] for j in need],
