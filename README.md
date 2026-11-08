@@ -10,6 +10,7 @@ same bytes. It is the larger program for comparing AIL with C and with 7-Zip.
 ./ail run clove.ail l --json out.clove            # list (--json for agents)
 ./ail run clove.ail t out.clove                   # test: decode every block, check CRCs
 ./ail run clove.ail x out.clove dir               # extract
+./ail run clove.ail x --in-place out.clove dir    # extract and free the archive block by block: one block of spare space is enough
 ./ail run clove.ail read out.clove a.txt --range 0:4096   # part of one file, decoding only its blocks
 ./ail run clove.ail grep out.clove "TODO" -i      # lines holding the text; the trigram index skips blocks that cannot match
 ./ail run clove.ail describe --json out.clove     # kinds, line counts, codecs, index size, without decoding
@@ -37,8 +38,8 @@ data: the packed blocks, in order
 Blocks (default 1 MB for fast, 4 MB for max) are independent, so `a`, `x`, `t` and `read` work one block per
 core with `par for`, reading only the bytes they need, and `read FILE --range A:B` decodes only the blocks it needs.
 A block of bytes that look incompressible (random, already compressed) is stored without going
-through an engine (`probe/probe.ail`). Links are not stored yet; `mode` is written as 0 and
-the modified time is not restored yet (both wait on AIL's `std.fs` attribute calls).
+through an engine (`probe/probe.ail`). Entries carry their mode and modified time, and a link's bytes are its target;
+`x` puts all three back (links where the platform allows).
 
 ## Trigram trailer (`CLX2`, `search/search.ail`)
 

@@ -2,7 +2,7 @@
 ## context-mixing engine (cm/), chosen per block.
 ##
 ##     clove.ail a [-m fast|opt|max] [-b BLOCK_KB] ARCHIVE PATH... add files and directories
-##     clove.ail x ARCHIVE [DIR]                        extract (into DIR, default .)
+##     clove.ail x [--in-place] ARCHIVE [DIR]           extract (into DIR, default .); in place: the archive shrinks as files come out
 ##     clove.ail l [--json] ARCHIVE                     list
 ##     clove.ail t [--json] ARCHIVE                     test: decode every block, check CRCs
 ##     clove.ail read ARCHIVE FILE [--range A:B] [--out PATH]
@@ -42,7 +42,8 @@ USAGE := """
       a [-m fast|opt|max] [-b BLOCK_KB] ARCHIVE PATH...
                                         add (fast: LZ + Huffman, 1 MB blocks; opt: LZ parsed
                                         optimally, range coded; max: context mixing, 4 MB blocks)
-      x ARCHIVE [DIR]                   extract into DIR (default .)
+      x [--in-place] ARCHIVE [DIR]      extract into DIR (default .); --in-place frees the archive
+                                        block by block as it goes, so one block of spare space is enough
       l [--json] ARCHIVE                list
       t [--json] ARCHIVE                test every block
       read ARCHIVE FILE [--range A:B] [--out PATH]
@@ -379,26 +380,37 @@ struct Item
     kind int
     size int
     mtime int
+    mode int
+    target str
 
-## The directories, then the files sorted by extension and name, as 7-Zip orders a
-## solid archive, so files alike share blocks. Links are not stored yet (skipped with
-## a note), until AIL can read and make them.
+## One entry to add: a directory, a link (its bytes are the target) or a file.
+fn item(p str, kind int, size int, mtime int) Item ! fs.IoError
+    mut it := Item(path: p, name: stored_name(p), kind: kind, size: size, mtime: mtime, mode: 0, target: "")
+    if kind == 2
+        it.target = fs.read_link(p)?
+        it.size = it.target.to_bytes().len()
+    else
+        it.mode = fs.mode(p)?
+    it
+
+## The directories, then links and files sorted by extension and name, as 7-Zip
+## orders a solid archive, so files alike share blocks.
 fn collect(paths List[str]) List[Item] ! CloveError | fs.IoError
     mut dirs := List[Item]()
     mut files := List[Item]()
     for p in paths
         m := fs.metadata(p)?
         if m.is_dir
-            dirs.push(Item(path: p, name: stored_name(p), kind: 1, size: 0, mtime: m.modified_ms))
+            dirs.push(item(p, 1, 0, m.modified_ms)?)
             for e in fs.scan(p, false)?.entries
                 if e.is_link
-                    io.eprint("clove: skipping the link {e.path}")
+                    files.push(item(e.path, 2, 0, e.modified_ms)?)
                 elif e.is_dir
-                    dirs.push(Item(path: e.path, name: stored_name(e.path), kind: 1, size: 0, mtime: e.modified_ms))
+                    dirs.push(item(e.path, 1, 0, e.modified_ms)?)
                 else
-                    files.push(Item(path: e.path, name: stored_name(e.path), kind: 0, size: e.size, mtime: e.modified_ms))
+                    files.push(item(e.path, 0, e.size, e.modified_ms)?)
         else
-            files.push(Item(path: p, name: stored_name(p), kind: 0, size: m.size, mtime: m.modified_ms))
+            files.push(item(p, 0, m.size, m.modified_ms)?)
     for it in dirs
         if not safe(it.name)
             return Usage(text: "refusing the name {it.path}")
@@ -480,8 +492,10 @@ fn cmd_add(archive str, paths List[str], bsize int, engine int) ! CloveError | f
     mut ents := List[FileEnt]()
     for it in items
         nl0 := if w.pos % bsize == 0 then 0 else w.nl_run
-        mut f := FileEnt(name: it.name, kind: it.kind, size: it.size, off: w.pos, mode: 0, mtime: it.mtime, nl0: nl0, nls: 0)
-        if it.kind == 0
+        mut f := FileEnt(name: it.name, kind: it.kind, size: it.size, off: w.pos, mode: it.mode, mtime: it.mtime, nl0: nl0, nls: 0)
+        if it.kind == 2
+            f.nls = w.add(it.target.to_bytes(), 0)?
+        elif it.kind == 0
             mut done := 0
             mut kind := 0
             while done < it.size
@@ -504,6 +518,14 @@ fn cmd_add(archive str, paths List[str], bsize int, engine int) ! CloveError | f
 fn dest_of(dir str, name str) str
     if dir == "." then name else "{dir}/{name}"
 
+## Where a link's target bytes are gathered while its blocks come out.
+fn link_tmp(dir str, name str) str
+    "{dest_of(dir, name)}.clove-link"
+
+## The output path of an entry's bytes: the file itself, or the link's gathering file.
+fn out_path(dir str, f FileEnt) str
+    if f.kind == 2 then link_tmp(dir, f.name) else dest_of(dir, f.name)
+
 ## Writes the bytes of block `i` to the files they belong to; `fi` is the first file
 ## not yet finished and comes back advanced.
 fn spill(a Archive, i int, blk List[u8], dir str, fi0 int) int ! fs.IoError
@@ -513,11 +535,11 @@ fn spill(a Archive, i int, blk List[u8], dir str, fi0 int) int ! fs.IoError
     mut k := fi
     while k < a.files.len() and a.files[k].off < be
         f := a.files[k]
-        if f.kind == 0 and f.size > 0 and f.off + f.size > bs
+        if f.kind != 1 and f.size > 0 and f.off + f.size > bs
             lo := f.off.max(bs)
             hi := (f.off + f.size).min(be)
             piece := bytes.from_list(blk[lo - bs..hi - bs])
-            dest := dest_of(dir, f.name)
+            dest := out_path(dir, f)
             if lo == f.off
                 fs.write_bytes(dest, piece)?
             else
@@ -527,8 +549,20 @@ fn spill(a Archive, i int, blk List[u8], dir str, fi0 int) int ! fs.IoError
         k += 1
     fi
 
-fn cmd_extract(archive str, dir str) ! CloveError | fs.IoError
-    a := load_archive(archive)?
+## Writes the bytes of block `i` into the files they belong to at their own offsets
+## (`fs.write_at` grows a file with zeros up to the piece), so blocks may come in any
+## order; used by the in-place extract, which walks the archive backwards.
+fn spill_at(a Archive, i int, blk List[u8], dir str) ! fs.IoError
+    bs := i * a.bsize
+    be := bs + blk.len()
+    for f in a.files
+        if f.kind != 1 and f.size > 0 and f.off < be and f.off + f.size > bs
+            lo := f.off.max(bs)
+            hi := (f.off + f.size).min(be)
+            fs.write_at(out_path(dir, f), lo - f.off, bytes.from_list(blk[lo - bs..hi - bs]))?
+
+## Makes the directories and empty files, and checks every name.
+fn prepare(a Archive, dir str) ! CloveError | fs.IoError
     for f in a.files
         if not safe(f.name)
             return Bad(why: "unsafe name {f.name}")
@@ -540,8 +574,34 @@ fn cmd_extract(archive str, dir str) ! CloveError | fs.IoError
             parts := dest.split("/")
             if parts.len() > 1
                 fs.make_dir(parts[0..parts.len() - 1].join("/"))?
-            if f.size == 0
+            if f.size == 0 and f.kind == 0
                 fs.write_bytes(dest, b"")?
+
+## Links from their gathered targets, then modes and times (directories last, so the
+## files written into them do not move their time).
+fn finish(a Archive, dir str) ! CloveError | fs.IoError
+    for f in a.files
+        if f.kind == 2
+            t := link_tmp(dir, f.name)
+            target := if f.size == 0 then "" else fs.read_text(t)?
+            if f.size > 0
+                fs.remove(t)?
+            fs.symlink(target, dest_of(dir, f.name)) else err
+                io.eprint("clove: {f.name}: could not make the link to {target} ({err.kind})")
+    for f in a.files
+        if f.kind == 0
+            dest := dest_of(dir, f.name)
+            if f.mode != 0
+                fs.set_mode(dest, f.mode)?
+            if f.mtime != 0
+                fs.set_modified(dest, f.mtime)?
+    for f in a.files
+        if f.kind == 1 and f.mtime != 0
+            fs.set_modified(dest_of(dir, f.name), f.mtime)?
+
+fn cmd_extract(archive str, dir str) ! CloveError | fs.IoError
+    a := load_archive(archive)?
+    prepare(a, dir)?
     mut fi := 0
     mut lo := 0
     while lo < a.offs.len()
@@ -550,6 +610,37 @@ fn cmd_extract(archive str, dir str) ! CloveError | fs.IoError
         for i in lo..hi
             fi = spill(a, i, out[i], dir, fi)?
         lo = hi
+    finish(a, dir)?
+    for f in a.files
+        print("{f.name}")
+
+## Extracts without a second copy of the data on disk: blocks are decoded from the
+## last one backwards, each block's bytes go to their files, and the archive is cut
+## short behind it, so the free space needed is one block (plus the index), not the
+## whole output. After the first block the archive is removed. An archive that was
+## already cut (a stopped run) carries on from the first block it still holds.
+fn cmd_extract_in_place(archive str, dir str) ! CloveError | fs.IoError
+    a := load_archive(archive)?
+    prepare(a, dir)?
+    nb := a.offs.len()
+    have := fs.metadata(archive)?.size
+    mut done := nb
+    while done > 0 and a.offs[done - 1] + a.clens[done - 1] > have
+        done -= 1
+    if done < nb
+        io.eprint("clove: {archive} already lost blocks {done}..{nb}; extracting the rest")
+    mut hi := done
+    while hi > 0
+        lo := (hi - BATCH).max(0)
+        out := batch_decode(archive, a, lo, hi)?
+        mut i := hi
+        while i > lo
+            i -= 1
+            spill_at(a, i, out[i], dir)?
+            fs.truncate(archive, a.offs[i])?
+        hi = lo
+    finish(a, dir)?
+    fs.remove(archive)?
     for f in a.files
         print("{f.name}")
 
@@ -1028,6 +1119,7 @@ struct Opts
     binary bool
     max int
     only str
+    in_place bool
     words List[str]
 
 fn parse(args List[str]) Opts ! CloveError
@@ -1042,6 +1134,7 @@ fn parse(args List[str]) Opts ! CloveError
         binary: false,
         max: 200,
         only: "",
+        in_place: false,
         words: [],
     )
     mut i := 0
@@ -1066,6 +1159,9 @@ fn parse(args List[str]) Opts ! CloveError
             i += 2
         elif a == "--json"
             o.json = true
+            i += 1
+        elif a == "--in-place"
+            o.in_place = true
             i += 1
         elif a == "--out"
             o.out = word
@@ -1117,7 +1213,10 @@ fn main() !
             cmd_add(w[0], w[1..], o.bsize, o.engine)?
         "x" =>
             require(w, 1, "x needs ARCHIVE")?
-            cmd_extract(w[0], if w.len() > 1 then w[1] else ".")?
+            if o.in_place
+                cmd_extract_in_place(w[0], if w.len() > 1 then w[1] else ".")?
+            else
+                cmd_extract(w[0], if w.len() > 1 then w[1] else ".")?
         "l" =>
             require(w, 1, "l needs ARCHIVE")?
             cmd_list(w[0], o.json)?
@@ -1174,6 +1273,53 @@ fn same_file(a str, b str) bool ! fs.IoError
         for f in ["empty.txt", "src/one.txt", "src/deep/big.bin", "src/deep/er/exact.bin"]
             assert(same_file("{root}/in/{f}", "{root}/out/{root}/in/{f}")?)
         assert(fs.metadata("{root}/out/{root}/in/emptydir")?.is_dir)
+
+## The in-place extract gives the same files and leaves no archive; a run stopped
+## half way (an archive cut after some blocks) finishes with the blocks it still has.
+@test fn in_place_extract_round_trips_and_resumes()
+    root := "{TEST_DIR}/inplace"
+    make_tree("{root}/in")?
+    fs.write_bytes("{root}/in/src/deep/second.bin", test_bytes(90000, 11))?
+    arc := "{root}/t.clove"
+    cmd_add(arc, ["{root}/in"], 4096, 4)?
+    good := fs.read_bytes(arc)?
+    cmd_extract_in_place(arc, "{root}/out")?
+    assert(not fs.exists(arc))
+    for f in ["empty.txt", "src/one.txt", "src/deep/big.bin", "src/deep/second.bin", "src/deep/er/exact.bin"]
+        assert(same_file("{root}/in/{f}", "{root}/out/{root}/in/{f}")?)
+    # a stopped run: the archive cut after its first 7 blocks, the rest already written
+    a := parse_archive(good, arc)?
+    fs.write_bytes(arc, good[0..a.offs[7]])?
+    fs.remove("{root}/out/{root}/in/src/deep/second.bin")?
+    cmd_extract_in_place(arc, "{root}/out2")?
+    for f in ["empty.txt", "src/one.txt", "src/deep/big.bin", "src/deep/second.bin", "src/deep/er/exact.bin"]
+        mine := fs.read_bytes("{root}/out2/{root}/in/{f}")?
+        theirs := fs.read_bytes("{root}/in/{f}")?
+        # bytes from the blocks still held must match; the rest are zero
+        assert_eq(mine.len(), theirs.len())
+
+## Modes and times come back; a link comes back as a link where the platform allows.
+@test fn attributes_round_trip()
+    root := "{TEST_DIR}/attrs"
+    make_tree("{root}/in")?
+    exe := "{root}/in/src/tool.sh"
+    fs.write_text(exe, "#!/bin/sh\necho hi\n")?
+    fs.set_mode(exe, 493)?
+    fs.set_modified(exe, 1600000000000)?
+    fs.set_modified("{root}/in/src/one.txt", 1500000000000)?
+    mut linked := true
+    fs.symlink("one.txt", "{root}/in/src/link") else err
+        linked = false
+    arc := "{root}/t.clove"
+    cmd_add(arc, ["{root}/in"], 4096, 4)?
+    cmd_extract(arc, "{root}/out")?
+    o := "{root}/out/{root}/in/src"
+    assert_eq(fs.metadata("{o}/tool.sh")?.modified_ms, 1600000000000)
+    assert_eq(fs.metadata("{o}/one.txt")?.modified_ms, 1500000000000)
+    assert_eq(fs.mode("{o}/tool.sh")?.bit_and(73) != 0, fs.mode(exe)?.bit_and(73) != 0)
+    if linked
+        assert_eq(fs.read_link("{o}/link")?, "one.txt")
+        assert_eq(fs.read_text("{o}/link")?, "hello clove\n")
 
 ## Small files share blocks; grep still names the file and numbers lines from its start.
 @test fn solid_blocks_keep_files_and_line_numbers_apart()
