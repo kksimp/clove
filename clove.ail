@@ -1292,11 +1292,12 @@ fn same_file(a str, b str) bool ! fs.IoError
     fs.write_bytes(arc, good[0..a.offs[7]])?
     fs.remove("{root}/out/{root}/in/src/deep/second.bin")?
     cmd_extract_in_place(arc, "{root}/out2")?
-    for f in ["empty.txt", "src/one.txt", "src/deep/big.bin", "src/deep/second.bin", "src/deep/er/exact.bin"]
-        mine := fs.read_bytes("{root}/out2/{root}/in/{f}")?
-        theirs := fs.read_bytes("{root}/in/{f}")?
-        # bytes from the blocks still held must match; the rest are zero
-        assert_eq(mine.len(), theirs.len())
+    assert(not fs.exists(arc))
+    # the stream starts with the .bin files (sorted by extension): big.bin's first 7 blocks are back
+    mine := fs.read_bytes("{root}/out2/{root}/in/src/deep/big.bin")?
+    theirs := fs.read_bytes("{root}/in/src/deep/big.bin")?
+    assert_eq(mine.len(), 7 * 4096)
+    assert_eq(mine, theirs[0..mine.len()])
 
 ## Modes and times come back; a link comes back as a link where the platform allows.
 @test fn attributes_round_trip()
