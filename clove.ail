@@ -127,8 +127,16 @@ fn raw_len(size int, bsize int, i int) int
 ## executable filter in the next 2 (0 none, 1 x86-64, 2 ARM64; never on stored blocks).
 ## `engine` is 1 (max: cm), 2 (lz level 5), 3 (opt: lz level 9, coded as lz) or 4 (fast).
 ## `kinds[i]` is the executable filter for block i (the kind of the file at its first byte).
+## The opt engine's search depths: CLOVE_OPT_DEPTH and CLOVE_OPT_SKIP override the
+## defaults (32 and 8), for benchmarks only.
+fn opt_depths()(int, int)
+    depth := (env.get("CLOVE_OPT_DEPTH") else "32").to_int() else 32
+    skip := (env.get("CLOVE_OPT_SKIP") else "8").to_int() else 8
+    (depth, skip)
+
 fn pack(data bytes, bsize int, engine int, kinds List[int]) Packed
     nb := nblocks(data.len(), bsize)
+    od := opt_depths()
     mut parts := [List[u8]() for _ in 0..nb]
     mut crcs := [0 for _ in 0..nb]
     mut ents := [List[int]() for _ in 0..nb]
@@ -153,8 +161,10 @@ fn pack(data bytes, bsize int, engine int, kinds List[int]) Packed
                     c = cm.compress(src, kind)
                 elif engine == 4
                     c = fast.compress(src, 8)
+                elif engine == 3
+                    c = lz.compress_tuned(src, od.0, od.1)
                 else
-                    c = lz.compress(src, if engine == 3 then 9 else 5)
+                    c = lz.compress(src, 5)
                 parts[i] = if c.len() < blk.len() then c else blk
         for i in first..last
             all = all + bytes.from_list(parts[i])

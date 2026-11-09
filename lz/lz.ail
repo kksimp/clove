@@ -229,9 +229,15 @@ fn depth_of(level int) int
 
 ## Compresses `d` to a self-contained range-coded block; level 1-6 parse greedily or
 ## lazily with deeper searches, level 9 parses optimally (compress_opt).
+## Level 9 with its own search depths: `depth` candidates per position, `skip`
+## for the positions inside a long match that is taken whole (the bench knobs
+## CLOVE_OPT_DEPTH and CLOVE_OPT_SKIP; the defaults are what `compress` uses).
+pub fn compress_tuned(d List[u8], depth int, skip int) List[u8]
+    compress_opt(d, depth.max(1), skip.max(1))
+
 pub fn compress(d List[u8], level int) List[u8]
     if level >= 9
-        return compress_opt(d, 32)
+        return compress_opt(d, 32, 8)
     n := d.len()
     depth := depth_of(level)
     lazy := level >= 3
@@ -452,6 +458,7 @@ PRICE := [
 
 OPT := 4096
 NICE := 64
+GOOD := 32
 INF := 1152921504606846976
 
 fn pb(p List[int], i int, b int) int
@@ -613,6 +620,8 @@ fn bt_find(
             cl[nc] = l
             cd[nc] = pos - c - 1
             nc += 1
+        if l >= GOOD
+            left = left.min(2)
         if l >= limit
             son[ptr1] = son[2 * c]
             son[ptr0] = son[2 * c + 1]
@@ -636,7 +645,7 @@ fn bt_find(
 ## length of every match the binary tree finds), found front to back, then coded.
 ## A match of NICE bytes or more is taken as it is and ends the window. The
 ## decoder is the same as for the other levels.
-fn compress_opt(d List[u8], depth int) List[u8]
+fn compress_opt(d List[u8], depth int, skip int) List[u8]
     n := d.len()
     mut e := Enc(out: [], lo: 0, rng: 4294967295, cache: 0, csize: 1, p: [1024 for _ in 0..PROBS])
     mut bhead := [(0).to_u32() for _ in 0..BMASK + 1]
@@ -721,7 +730,7 @@ fn compress_opt(d List[u8], depth int) List[u8]
                             mut son,
                             q,
                             MAXLEN.min(n - q),
-                            depth,
+                            skip,
                             false,
                             mut cl,
                             mut cd,
@@ -927,16 +936,17 @@ pub fn decompress(src List[u8], n int) List[u8]
         .bit_or(src[3].to_int().shl(8))
         .bit_or(src[4].to_int())
     mut dc := Dec(src: src, pos: 5, code: code, rng: 4294967295, p: [1024 for _ in 0..PROBS])
-    mut out := List[u8]()
+    mut out := [(0).to_u8() for _ in 0..n]
+    mut pos := 0
     mut state := 0
     mut reps := [0, 0, 0, 0]
-    while out.len() < n
-        pos := out.len()
+    while pos < n
         ps := pos.bit_and(3)
         if dc.bit(IS_MATCH + state * 4 + ps) == 0
             prevb := if pos > 0 then out[pos - 1].to_int() else 0
             mb := if pos > reps[0] then out[pos - reps[0] - 1].to_int() else -1
-            out.push(dc.lit(prevb, mb, state >= 7).to_u8())
+            out[pos] = dc.lit(prevb, mb, state >= 7).to_u8()
+            pos += 1
             state = after_lit(state)
             continue
         mut l := 0
@@ -945,7 +955,8 @@ pub fn decompress(src List[u8], n int) List[u8]
                 if dc.bit(IS_LONG + state * 4 + ps) == 0
                     if pos <= reps[0]
                         return []
-                    out.push(out[pos - reps[0] - 1])
+                    out[pos] = out[pos - reps[0] - 1]
+                    pos += 1
                     state = after_short(state)
                     continue
             elif dc.bit(IS_G1 + state) == 0
@@ -962,8 +973,11 @@ pub fn decompress(src List[u8], n int) List[u8]
         at := pos - reps[0] - 1
         if at < 0 or pos + l > n
             return []
-        for k in 0..l
-            out.push(out[at + k])
+        mut k := 0
+        while k < l
+            out[pos + k] = out[at + k]
+            k += 1
+        pos += l
     out
 
 @test fn roundtrips_text()
