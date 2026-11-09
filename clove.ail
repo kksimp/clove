@@ -40,7 +40,7 @@ BLOCK_ENT := 17
 USAGE := """
     usage: clove COMMAND ...
       a [-m fast|opt|max] [-b BLOCK_KB] ARCHIVE PATH...
-                                        add (fast: LZ + Huffman, 1 MB blocks; opt: LZ parsed
+                                        add (fast: LZ + tANS, 1 MB blocks; opt: LZ parsed
                                         optimally, range coded; max: context mixing, 4 MB blocks)
       x ARCHIVE [DIR]                   extract into DIR (default .)
       l [--json] ARCHIVE                list
