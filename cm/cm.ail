@@ -1,5 +1,5 @@
 ## Clove's max engine (engine 1): a bitwise context-mixing model with a
-## long-range match model (the LZ part), two gated logistic mixers, two SSE
+## long-range match model (the LZ part), a two-layer gated logistic mixer, three SSE
 ## stages and a carry-less arithmetic coder. Integer arithmetic only, so every
 ## machine produces and reads the same bytes.
 ##
@@ -12,12 +12,15 @@
 ## probability, so a context that has seen "0 0 0 1" and one that has seen
 ## "1 0 0 0" predict differently although both counted the same bits. Each
 ## history gives the mixers two inputs: its logit and, when it has been seen at
-## all, its linear lean. Two mixers weigh the inputs, one by the partial byte and
-## one by the previous byte and the match state; a final two-weight mixer per bit
-## position joins them; two SSE stages refine the result by order-0 and order-1
-## context. Each nibble bucket carries a check word, so a hash collision clears
-## the bucket instead of mixing two contexts' histories. Table sizes grow with
-## the block (both sides know its length), so small blocks stay cheap.
+## all, its linear lean. Four first-layer mixers weigh the inputs, selected by the
+## partial byte, by the previous byte and the match state, by the byte before that,
+## and by the current word (the position in a 4-byte word in machine code); a learned
+## final mixer joins their four outputs, its weights selected by the match state and
+## the bit position; three SSE stages refine the result by order-0 context, order-1
+## context and by order-1 context with the match length bucket. Each nibble bucket
+## carries a check word, so a hash collision clears the bucket instead of mixing two
+## contexts' histories. Table sizes grow with the block (both sides know its length),
+## so small blocks stay cheap.
 
 NORD := 8
 NIN := 19
@@ -177,6 +180,8 @@ struct Model
     st List[int]
     wa List[int]
     wb List[int]
+    wc List[int]
+    wd List[int]
     wf List[int]
     dotf int
     msm List[int]
@@ -184,6 +189,7 @@ struct Model
     mbits int
     a1 List[u32]
     a2 List[u32]
+    a3 List[u32]
     buf List[u8]
     sq List[int]
     dt List[int]
@@ -198,11 +204,17 @@ struct Model
     mctx int
     sela int
     selb int
+    selc int
+    seld int
+    selw int
     dota int
     dotb int
+    dotc int
+    dotd int
     pmix int
     i1 int
     i2 int
+    i3 int
     pr int
     exe int
 
@@ -229,13 +241,16 @@ fn new_model(n int, exe int) Model
         st: [0 for _ in 0..NIN],
         wa: [if k % NIN < 1 + NORD or k % NIN >= 1 + 2 * NORD then 16000 else 4000 for k in 0..NIN * 256],
         wb: [if k % NIN < 1 + NORD or k % NIN >= 1 + 2 * NORD then 16000 else 4000 for k in 0..NIN * 1024],
-        wf: [32768 for _ in 0..16],
+        wc: [if k % NIN < 1 + NORD or k % NIN >= 1 + 2 * NORD then 16000 else 4000 for k in 0..NIN * 256],
+        wd: [if k % NIN < 1 + NORD or k % NIN >= 1 + 2 * NORD then 16000 else 4000 for k in 0..NIN * 1024],
+        wf: [16384 for _ in 0..128],
         dotf: 0,
         msm: [INIT for _ in 0..64],
         mtab: [(0).to_u32() for _ in 0..(1).shl(mbits)],
         mbits: mbits,
         a1: apm_init(256),
         a2: apm_init(65536),
+        a3: apm_init(1024),
         buf: [],
         sq: stretch_table(),
         dt: delta_table(),
@@ -250,11 +265,17 @@ fn new_model(n int, exe int) Model
         mctx: 0,
         sela: 0,
         selb: 0,
+        selc: 0,
+        seld: 0,
+        selw: 0,
         dota: 0,
         dotb: 0,
+        dotc: 0,
+        dotd: 0,
         pmix: 2048,
         i1: 0,
         i2: 0,
+        i3: 0,
         pr: 2048,
         exe: exe,
     )
@@ -288,6 +309,8 @@ fn Model.apm(mut self, stage int, cx int, p int) int
     w := s.bit_and(127)
     if stage == 1
         return (a1[j].to_int() * (128 - w) + a1[j + 1].to_int() * w).shr(11)
+    if stage == 3
+        return (a3[j].to_int() * (128 - w) + a3[j + 1].to_int() * w).shr(11)
     (a2[j].to_int() * (128 - w) + a2[j + 1].to_int() * w).shr(11)
 
 fn Model.adapt(mut self, e int, y int, limit int) int
@@ -329,31 +352,57 @@ fn Model.predict(mut self) int
             mb = 2
     sela = c0 * NIN
     selb = (c4.bit_and(255) + 256 * mb) * NIN
+    selc = c4.shr(8).bit_and(255) * NIN
+    seld = (if exe == 0 then word0.bit_and(1023) else buf.len().bit_and(3) * 256 + c4.shr(24)) * NIN
+    selw = (mb * 8 + bitpos) * 4
     mut da := 0
     mut db := 0
+    mut dc := 0
+    mut dd := 0
     for k in 0..NIN
         da += wa[sela + k] * st[k]
         db += wb[selb + k] * st[k]
+        dc += wc[selc + k] * st[k]
+        dd += wd[seld + k] * st[k]
     dota = (da / 65536).max(-2047).min(2047)
     dotb = (db / 65536).max(-2047).min(2047)
-    dotf = ((wf[bitpos * 2] * dota + wf[bitpos * 2 + 1] * dotb) / 65536).max(-2047).min(2047)
+    dotc = (dc / 65536).max(-2047).min(2047)
+    dotd = (dd / 65536).max(-2047).min(2047)
+    df := wf[selw] * dota + wf[selw + 1] * dotb + wf[selw + 2] * dotc + wf[selw + 3] * dotd
+    dotf = (df / 65536).max(-2047).min(2047)
     pmix = squash(dotf).max(1).min(4095)
     i1 = c0
     i2 = c0 + c4.bit_and(255).shl(8)
+    mut lbk := 0
+    if active == 1
+        lbk = 3
+        if mlen < 8
+            lbk = 1
+        elif mlen < 16
+            lbk = 2
+    i3 = c4.bit_and(255) * 4 + lbk
     p1 := apm(1, i1, pmix)
     p2 := apm(2, i2, pmix)
-    pr = ((pmix + p1 + 2 * p2) / 4).max(1).min(4095)
+    p3 := apm(3, i3, pmix)
+    sse := (p1 + p2 + 2 * p3) / 4
+    pr = ((3 * sse + pmix) / 4).max(1).min(4095)
     pr
 
 fn Model.update(mut self, y int)
     ea := (y.shl(12) - squash(dota)) * 6
     eb := (y.shl(12) - squash(dotb)) * 6
+    ec := (y.shl(12) - squash(dotc)) * 6
+    ed := (y.shl(12) - squash(dotd)) * 6
     for k in 0..NIN
         wa[sela + k] += (st[k] * ea + 32768) / 65536
         wb[selb + k] += (st[k] * eb + 32768) / 65536
+        wc[selc + k] += (st[k] * ec + 32768) / 65536
+        wd[seld + k] += (st[k] * ed + 32768) / 65536
     ef := (y.shl(12) - pmix) * 2
-    wf[bitpos * 2] += (dota * ef + 32768) / 65536
-    wf[bitpos * 2 + 1] += (dotb * ef + 32768) / 65536
+    wf[selw] += (dota * ef + 32768) / 65536
+    wf[selw + 1] += (dotb * ef + 32768) / 65536
+    wf[selw + 2] += (dotc * ef + 32768) / 65536
+    wf[selw + 3] += (dotd * ef + 32768) / 65536
     s := sq[pmix] + 2048
     j0 := s.shr(7)
     near := if s.bit_and(127) < 64 then j0 else j0 + 1
@@ -364,6 +413,9 @@ fn Model.update(mut self, y int)
     j2 := i2 * 33 + near
     v2 := a2[j2].to_int()
     a2[j2] = (v2 + (g - v2) / 128).to_u32()
+    j3 := i3 * 33 + near
+    v3 := a3[j3].to_int()
+    a3[j3] = (v3 + (g - v3) / 128).to_u32()
     e0 := adapt(o0[c0], y, LIMIT)
     o0[c0] = e0
     for i in 0..NORD
@@ -514,6 +566,24 @@ pub fn decompress(src List[u8], n int, exe int) List[u8]
     assert(c.len() < d.len())
     assert_eq(decompress(c, d.len(), 0), d)
     assert_eq(decompress(compress(d, 1), d.len(), 1), d)
+
+@test fn roundtrips_mixed_megabyte()
+    words := ["the", "of", "and", "clove", "mixer", "context", "model", "bit", "byte", "state"]
+    mut d := List[u8]()
+    mut x := 12345
+    while d.len() < 1048576
+        x = (x * 1103515245 + 12345).bit_and(2147483647)
+        if (x / 65536) % 5 == 0
+            for _ in 0..64
+                x = (x * 1103515245 + 12345).bit_and(2147483647)
+                d.push((x / 65536).bit_and(255).to_u8())
+        else
+            for ch in words[(x / 65536) % 10].to_bytes()
+                d.push(ch)
+            d.push((32).to_u8())
+    c := compress(d, 0)
+    assert(c.len() < d.len())
+    assert_eq(decompress(c, d.len(), 0), d)
 
 @test fn roundtrips_tiny()
     for n in 0..5
