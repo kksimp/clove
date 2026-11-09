@@ -6,7 +6,8 @@ model, written only in AIL with integer arithmetic, so every machine produces th
 same bytes. It is the larger program for comparing AIL with C and with 7-Zip.
 
 ```sh
-./ail run clove.ail a out.clove src/ notes.txt    # add (block size with -b KB)
+./ail run clove.ail a out.clove src/ notes.txt    # add (block size with -b KB; -m auto is the default)
+./ail run clove.ail a -m opt --threads 1 --progress out.clove src/   # one engine, blocks in order, a stderr line per 64 blocks
 ./ail run clove.ail l --json out.clove            # list (--json for agents)
 ./ail run clove.ail t out.clove                   # test: decode every block, check CRCs
 ./ail run clove.ail x out.clove dir               # extract
@@ -36,6 +37,12 @@ data: the packed blocks, in order
 
 Blocks (default 1 MB for fast, 4 MB for max) are independent, so `a`, `x`, `t` and `read` work one block per
 core with `par for`, reading only the bytes they need, and `read FILE --range A:B` decodes only the blocks it needs.
+`-m auto` (the default for `a` and `c`) picks the engine per block (`auto/auto.ail`): it compresses
+a 32 KB sample from the start of the block with the fast engine; a sample that shrinks under 2% stores
+the block, an executable block or a sample ratio above 4 uses opt, anything else uses fast. The choice
+is the block's engine byte, so any build decodes the archive. `--threads 1` packs the blocks in order;
+the runtime cannot size its pool from a program, so any other number uses every core (set `AIL_THREADS`
+to cap it). `--progress` writes one line per 64-block batch to stderr: bytes in, bytes out, MB/s and ETA.
 A block of bytes that look incompressible (random, already compressed) is stored without going
 through an engine (`probe/probe.ail`). Links are not stored yet; `mode` is written as 0 and
 the modified time is not restored yet (both wait on AIL's `std.fs` attribute calls).

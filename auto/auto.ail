@@ -1,0 +1,24 @@
+## Clove's `-m auto` choice of engine for one block. It compresses a 32 KB sample from the
+## start of the block with the fast engine, and reads the answer off the sample's ratio:
+## a sample that shrinks under 2% means the block is stored; a block with an executable
+## filter (`kind` not 0) or a sample ratio above 4 goes to opt (LZ parsed optimally, range
+## coded), where the slower parse pays; anything else goes to fast. Integer arithmetic only,
+## so every machine makes the same choice. The result is an engine number as `pack` takes
+## it: 0 stored, 3 opt, 4 fast.
+
+SAMPLE := 32768
+STORED := 0
+OPT := 3
+FAST := 4
+
+## The engine for block `d`, whose executable filter is `kind` (clove.auto.1).
+pub fn pick(d List[u8], kind int) int
+    n := d.len().min(SAMPLE)
+    if n == 0
+        return STORED
+    c := fast.compress(d[0..n], 8).len()
+    if c * 100 >= n * 98
+        return STORED
+    if kind != 0 or n > 4 * c
+        return OPT
+    FAST
