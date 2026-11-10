@@ -6,16 +6,26 @@
 ## Per bit, eight hashed context models (orders 1-4 and 6, the current word,
 ## the word pair, and a sparse context that skips a byte; in machine code the two
 ## word contexts become instruction contexts, see Model.end_byte), a direct order-0
-## model and the match model each give a probability. Two mixers weigh their
-## logits, one by the partial byte and one by the previous byte and the match
-## state; two SSE stages refine the result by order-0 and order-1 context.
-## Table sizes grow with the block (both sides know its length), so small
-## blocks stay cheap.
+## model and the match model each give a probability. A hashed slot holds a bit
+## history (a state of the machine in `states`: how many zeros and ones were seen
+## and which came last), and an adaptive map per order turns the state into a
+## probability, so a context that has seen "0 0 0 1" and one that has seen
+## "1 0 0 0" predict differently although both counted the same bits. Each
+## history gives the mixers two inputs: its logit and, when it has been seen at
+## all, its linear lean. Two mixers weigh the inputs, one by the partial byte and
+## one by the previous byte and the match state; a final two-weight mixer per bit
+## position joins them; two SSE stages refine the result by order-0 and order-1
+## context. Each nibble bucket carries a check word, so a hash collision clears
+## the bucket instead of mixing two contexts' histories. Table sizes grow with
+## the block (both sides know its length), so small blocks stay cheap.
 
 NORD := 8
-NIN := 11
+NIN := 19
 LIMIT := 255
 INIT := 1073741824
+NSTATES := 175
+RUNCAP := 40
+MIXCAP := 12
 
 ## squash/stretch as in the lpaq family: 12-bit probabilities, logits in -2047..2047.
 SQ := [
@@ -88,6 +98,66 @@ fn bits_for(n int, lo int, hi int) int
         b += 1
     b
 
+## The bit-history machine. A state is (zeros, ones, last bit); seeing a bit adds
+## one to its count and, when the other count is above two, halves that count (the
+## statistics are nonstationary: old evidence fades). A pure run counts to RUNCAP;
+## once both bits were seen the larger count stops at MIXCAP. The reachable states
+## are numbered in breadth-first order from (0, 0, 0), state 0 meaning never seen;
+## there are NSTATES of them. `nex[s * 2 + y]` is the state after bit y, and
+## `zeros`/`ones` give each state's counts for the maps' starting probabilities.
+struct States
+    nex List[int]
+    zeros List[int]
+    ones List[int]
+
+fn next_counts(n0 int, n1 int, y int)(int, int)
+    mut a := n0
+    mut b := n1
+    if y == 1
+        b += 1
+        if a > 2
+            a = a / 2 + 1
+    else
+        a += 1
+        if b > 2
+            b = b / 2 + 1
+    if b == 0
+        a = a.min(RUNCAP)
+    elif a == 0
+        b = b.min(RUNCAP)
+    elif a > b
+        a = a.min(MIXCAP)
+    else
+        b = b.min(MIXCAP)
+    (a, b)
+
+fn build_states() States
+    mut ids := [0 for _ in 0..(RUNCAP + 1) * (RUNCAP + 1) * 2]
+    mut zeros := [0]
+    mut ones := [0]
+    mut last := [0]
+    mut nex := List[int]()
+    ids[0] = 1
+    mut head := 0
+    while head < zeros.len()
+        n0 := zeros[head]
+        n1 := ones[head]
+        for y in 0..2
+            t := next_counts(n0, n1, y)
+            key := (t.0 * (RUNCAP + 1) + t.1) * 2 + y
+            if ids[key] == 0
+                zeros.push(t.0)
+                ones.push(t.1)
+                last.push(y)
+                ids[key] = zeros.len()
+            nex.push(ids[key] - 1)
+        head += 1
+    States(nex: nex, zeros: zeros, ones: ones)
+
+## The starting probability of a state: (ones + 1/2) / (zeros + ones + 1), 21 bits, count 0.
+fn map_init(st States) List[int]
+    [((st.ones[s] * 2 + 1).shl(21) / (st.zeros[s] * 2 + st.ones[s] * 2 + 2)).shl(10) for s in 0..NSTATES]
+
 ## The SSE curve of context `cx`: 33 points over the logit range (0..65661, so u32).
 fn apm_init(nctx int) List[u32]
     curve := [(squash((j - 16) * 128) * 16).to_u32() for j in 0..33]
@@ -100,9 +170,15 @@ struct Model
     idx List[int]
     bkt List[int]
     hv List[int]
+    chk List[int]
+    nex List[int]
+    sm List[int]
+    cur List[int]
     st List[int]
     wa List[int]
     wb List[int]
+    wf List[int]
+    dotf int
     msm List[int]
     mtab List[u32]
     mbits int
@@ -134,16 +210,27 @@ struct Model
 fn new_model(n int, exe int) Model
     tbits := bits_for(n * 2, 12, 21)
     mbits := bits_for(n, 10, 20)
+    states := build_states()
+    one_map := map_init(states)
+    mut sm := List[int]()
+    for _ in 0..NORD
+        sm.extend(one_map)
     mut m := Model(
-        t: [INIT.to_u32() for _ in 0..NORD * (1).shl(tbits)],
+        t: [(0).to_u32() for _ in 0..NORD * (1).shl(tbits)],
         tbits: tbits,
         o0: [INIT for _ in 0..256],
         idx: [0 for _ in 0..NORD],
         bkt: [0 for _ in 0..NORD],
         hv: [0 for _ in 0..NORD],
+        chk: [0 for _ in 0..NORD],
+        nex: states.nex,
+        sm: sm,
+        cur: [0 for _ in 0..NORD],
         st: [0 for _ in 0..NIN],
-        wa: [16000 for _ in 0..NIN * 256],
-        wb: [16000 for _ in 0..NIN * 1024],
+        wa: [if k % NIN < 1 + NORD or k % NIN >= 1 + 2 * NORD then 16000 else 4000 for k in 0..NIN * 256],
+        wb: [if k % NIN < 1 + NORD or k % NIN >= 1 + 2 * NORD then 16000 else 4000 for k in 0..NIN * 1024],
+        wf: [32768 for _ in 0..16],
+        dotf: 0,
         msm: [INIT for _ in 0..64],
         mtab: [(0).to_u32() for _ in 0..(1).shl(mbits)],
         mbits: mbits,
@@ -176,14 +263,20 @@ fn new_model(n int, exe int) Model
 
 ## Slots of the context models for the next bit. Each context hashes once per
 ## nibble to a bucket of 16 slots (64 bytes, one cache line); the bits of the
-## nibble so far pick the slot, so a byte costs two cache misses per context
-## instead of eight.
+## nibble so far pick slots 1..15, so a byte costs two cache misses per context
+## instead of eight. Slot 0 holds a check word from other bits of the hash: a
+## bucket that belongs to a different context is cleared before use.
 fn Model.set_idx(mut self)
     if bitpos == 0 or bitpos == 4
         bmask := (1).shl(tbits - 4) - 1
         for i in 0..NORD
-            bkt[i] = ((hv[i] + c0 * 40503) * 2654435761).shr(20).bit_and(bmask).shl(4)
-                + i.shl(tbits)
+            h := (hv[i] + c0 * 40503) * 2654435761
+            bkt[i] = h.shr(20).bit_and(bmask).shl(4) + i.shl(tbits)
+            check := h.shr(44).bit_and(65535) + 1
+            if t[bkt[i]].to_int() != check
+                t[bkt[i]] = check.to_u32()
+                for k in 1..16
+                    t[bkt[i] + k] = (0).to_u32()
     nib := if bitpos < 4 then c0 else (1).shl(bitpos - 4) + c0.bit_and((1).shl(bitpos - 4) - 1)
     for i in 0..NORD
         idx[i] = bkt[i] + nib
@@ -204,11 +297,17 @@ fn Model.adapt(mut self, e int, y int, limit int) int
     n2 := if n < limit then n + 1 else n
     p2.shl(10) + n2
 
-## The probability (12 bits) that the next bit is 1.
+## The probability (12 bits) that the next bit is 1. Inputs: 0 the order-0 model,
+## 1..8 the histories' logits, 9 the match model, 10 a bias, 11..18 the histories'
+## linear leans (0 for a context never seen).
 fn Model.predict(mut self) int
     st[0] = sq[o0[c0].shr(19)]
     for i in 0..NORD
-        st[i + 1] = sq[t[idx[i]].to_int().shr(19)]
+        s := t[idx[i]].to_int()
+        cur[i] = s
+        p := sm[i * NSTATES + s].shr(19)
+        st[i + 1] = sq[p]
+        st[11 + i] = if s == 0 then 0 else (p - 2048) / 4
     mut active := 0
     st[9] = 0
     mctx = -1
@@ -237,7 +336,8 @@ fn Model.predict(mut self) int
         db += wb[selb + k] * st[k]
     dota = (da / 65536).max(-2047).min(2047)
     dotb = (db / 65536).max(-2047).min(2047)
-    pmix = squash((dota + dotb) / 2).max(1).min(4095)
+    dotf = ((wf[bitpos * 2] * dota + wf[bitpos * 2 + 1] * dotb) / 65536).max(-2047).min(2047)
+    pmix = squash(dotf).max(1).min(4095)
     i1 = c0
     i2 = c0 + c4.bit_and(255).shl(8)
     p1 := apm(1, i1, pmix)
@@ -251,6 +351,9 @@ fn Model.update(mut self, y int)
     for k in 0..NIN
         wa[sela + k] += (st[k] * ea + 32768) / 65536
         wb[selb + k] += (st[k] * eb + 32768) / 65536
+    ef := (y.shl(12) - pmix) * 2
+    wf[bitpos * 2] += (dota * ef + 32768) / 65536
+    wf[bitpos * 2 + 1] += (dotb * ef + 32768) / 65536
     s := sq[pmix] + 2048
     j0 := s.shr(7)
     near := if s.bit_and(127) < 64 then j0 else j0 + 1
@@ -264,8 +367,10 @@ fn Model.update(mut self, y int)
     e0 := adapt(o0[c0], y, LIMIT)
     o0[c0] = e0
     for i in 0..NORD
-        j := idx[i]
-        t[j] = adapt(t[j].to_int(), y, LIMIT).to_u32()
+        s := cur[i]
+        j := i * NSTATES + s
+        sm[j] = adapt(sm[j], y, LIMIT)
+        t[idx[i]] = nex[s * 2 + y].to_u32()
     if mctx >= 0
         em := adapt(msm[mctx], y, 1023)
         msm[mctx] = em
@@ -382,6 +487,24 @@ pub fn decompress(src List[u8], n int, exe int) List[u8]
                 pos += 1
         out.push(m.buf[m.buf.len() - 1])
     out
+
+@test fn state_machine_is_closed_and_numbered()
+    st := build_states()
+    assert_eq(st.zeros.len(), NSTATES)
+    assert_eq(st.nex.len(), NSTATES * 2)
+    for x in st.nex
+        assert(x >= 0 and x < NSTATES)
+    # a run of ones climbs; a zero after it halves the ones
+    mut s := 0
+    for _ in 0..10
+        s = st.nex[s * 2 + 1]
+    assert_eq(st.ones[s], 10)
+    s = st.nex[s * 2]
+    assert_eq(st.ones[s], 6)
+    assert_eq(st.zeros[s], 1)
+    m := map_init(st)
+    assert(m[s].shr(19) > 2048)
+    assert(m[0].shr(19) == 2048)
 
 @test fn roundtrips_text()
     mut d := List[u8]()
