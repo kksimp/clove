@@ -72,7 +72,11 @@ pub fn incompressible(d List[u8]) bool
             c := heads[h]
             if c > 0
                 p := c - 1
-                if p >= lo and d[p] == d[i] and d[p + 1] == d[i + 1] and d[p + 2] == d[i + 2] and d[p + 3] == d[i + 3]
+                if p >= lo
+                    and d[p] == d[i]
+                    and d[p + 1] == d[i + 1]
+                    and d[p + 2] == d[i + 2]
+                    and d[p + 3] == d[i + 3]
                     repeats += 1
             heads[h] = i + 1
         total += hi - lo

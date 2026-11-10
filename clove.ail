@@ -314,7 +314,15 @@ fn parse_archive(b bytes, path str) Archive ! CloveError
         engines.push(eng)
         next += clen
         p += BLOCK_ENT
-    Archive(bsize: bsize, total: total, files: files, offs: offs, clens: clens, crcs: crcs, engines: engines)
+    Archive(
+        bsize: bsize,
+        total: total,
+        files: files,
+        offs: offs,
+        clens: clens,
+        crcs: crcs,
+        engines: engines,
+    )
 
 ## The blocks a file's bytes lie in: `b0..b1`.
 fn first_block(f FileEnt, bsize int) int
@@ -323,7 +331,14 @@ fn first_block(f FileEnt, bsize int) int
 fn end_block(f FileEnt, bsize int) int
     if f.size == 0 then first_block(f, bsize) else (f.off + f.size - 1) / bsize + 1
 
-fn header_bytes(bsize int, total int, files List[FileEnt], clens List[int], crcs List[int], engines List[int]) bytes
+fn header_bytes(
+    bsize int,
+    total int,
+    files List[FileEnt],
+    clens List[int],
+    crcs List[int],
+    engines List[int],
+) bytes
     mut h := List[int]()
     h.extend([67, 76, 86, 51])
     put(mut h, files.len(), 4)
@@ -394,11 +409,29 @@ fn collect(paths List[str]) List[Item] ! CloveError | fs.IoError
                 if e.is_link
                     io.eprint("clove: skipping the link {e.path}")
                 elif e.is_dir
-                    dirs.push(Item(path: e.path, name: stored_name(e.path), kind: 1, size: 0, mtime: e.modified_ms))
+                    dirs.push(Item(
+                        path: e.path,
+                        name: stored_name(e.path),
+                        kind: 1,
+                        size: 0,
+                        mtime: e.modified_ms,
+                    ))
                 else
-                    files.push(Item(path: e.path, name: stored_name(e.path), kind: 0, size: e.size, mtime: e.modified_ms))
+                    files.push(Item(
+                        path: e.path,
+                        name: stored_name(e.path),
+                        kind: 0,
+                        size: e.size,
+                        mtime: e.modified_ms,
+                    ))
         else
-            files.push(Item(path: p, name: stored_name(p), kind: 0, size: m.size, mtime: m.modified_ms))
+            files.push(Item(
+                path: p,
+                name: stored_name(p),
+                kind: 0,
+                size: m.size,
+                mtime: m.modified_ms,
+            ))
     for it in dirs
         if not safe(it.name)
             return Usage(text: "refusing the name {it.path}")
@@ -480,7 +513,16 @@ fn cmd_add(archive str, paths List[str], bsize int, engine int) ! CloveError | f
     mut ents := List[FileEnt]()
     for it in items
         nl0 := if w.pos % bsize == 0 then 0 else w.nl_run
-        mut f := FileEnt(name: it.name, kind: it.kind, size: it.size, off: w.pos, mode: 0, mtime: it.mtime, nl0: nl0, nls: 0)
+        mut f := FileEnt(
+            name: it.name,
+            kind: it.kind,
+            size: it.size,
+            off: w.pos,
+            mode: 0,
+            mtime: it.mtime,
+            nl0: nl0,
+            nls: 0,
+        )
         if it.kind == 0
             mut done := 0
             mut kind := 0
@@ -670,7 +712,10 @@ fn load_index(archive str, nblk int) search.Index ! fs.IoError
     if n < 8
         return none_found
     tail8 := fs.read_range(archive, n - 8, 8)?
-    tlen := tail8[0].to_int() + tail8[1].to_int().shl(8) + tail8[2].to_int().shl(16) + tail8[3].to_int().shl(24)
+    tlen := tail8[0].to_int()
+        + tail8[1].to_int().shl(8)
+        + tail8[2].to_int().shl(16)
+        + tail8[3].to_int().shl(24)
     if tlen < 8 or tlen > n
         return none_found
     search.load(fs.read_range(archive, n - tlen, tlen)?, nblk)
@@ -679,7 +724,10 @@ fn load_index(archive str, nblk int) search.Index ! fs.IoError
 fn index_bytes(archive str) bytes ! fs.IoError
     n := fs.metadata(archive)?.size
     tail8 := fs.read_range(archive, n - 8, 8)?
-    tlen := tail8[0].to_int() + tail8[1].to_int().shl(8) + tail8[2].to_int().shl(16) + tail8[3].to_int().shl(24)
+    tlen := tail8[0].to_int()
+        + tail8[1].to_int().shl(8)
+        + tail8[2].to_int().shl(16)
+        + tail8[3].to_int().shl(24)
     fs.read_range(archive, n - tlen, tlen)?
 
 ## Lines of `pat` in the archive's files. With the trigram trailer, only blocks whose filter
