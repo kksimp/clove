@@ -440,7 +440,7 @@ fn glob_match(pat str, name str) bool
     i == p.len()
 
 fn excluded(name str, pats List[str]) bool
-    base := if name.contains("/") then name.split("/").last() else name
+    base := name.split("/").last() else name
     for pat in pats
         if glob_match(pat, name) or (not pat.contains("/") and glob_match(pat, base))
             return true

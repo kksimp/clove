@@ -367,10 +367,10 @@ fn Model.update(mut self, y int)
     e0 := adapt(o0[c0], y, LIMIT)
     o0[c0] = e0
     for i in 0..NORD
-        s := cur[i]
-        j := i * NSTATES + s
+        hs := cur[i]
+        j := i * NSTATES + hs
         sm[j] = adapt(sm[j], y, LIMIT)
-        t[idx[i]] = nex[s * 2 + y].to_u32()
+        t[idx[i]] = nex[hs * 2 + y].to_u32()
     if mctx >= 0
         em := adapt(msm[mctx], y, 1023)
         msm[mctx] = em
