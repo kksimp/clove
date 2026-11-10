@@ -1,0 +1,420 @@
+## Clove's fast engine (codec 3): LZ77 with a hash chain and one-step lazy matching,
+## then canonical Huffman codes over byte-aligned little-endian bit packing, so a
+## block decodes with table lookups and byte copies, no arithmetic coding. It is
+## built for decode speed: one alphabet for literals, end of block and match lengths
+## (289 symbols) and one for distance slots (42), code lengths at most TBITS bits so
+## one 4096-entry table decodes any symbol in one lookup.
+##
+## Block layout: 331 nibbles of code lengths (one per symbol, packed two per byte,
+## 166 bytes), then the bit stream. Lengths 4..273 and distances 1..2^20: both are
+## coded as a slot of two mantissa bits plus an exponent, and the low bits raw.
+
+MINLEN := 4
+MAXLEN := 273
+WINDOW := 1048576
+NLIT := 289
+NDIST := 42
+EOB := 256
+TBITS := 12
+TSIZE := 4096
+HBITS := 16
+
+## Length code for v = len - MINLEN: 0..7 direct, then 4 codes per power of two.
+fn len_code(v int) int
+    if v < 8
+        return v
+    mut e := 3
+    while v.shr(e + 1) > 0
+        e += 1
+    8 + (e - 3) * 4 + v.shr(e - 2).bit_and(3)
+
+fn len_extra(code int) int
+    if code < 8 then 0 else (code - 8) / 4 + 1
+
+fn len_base(code int) int
+    if code < 8
+        return code
+    e := (code - 8) / 4 + 3
+    (4 + (code - 8) % 4).shl(e - 2)
+
+## Distance slot for d >= 1: 0..3 direct, then two codes per power of two.
+fn dist_code(d int) int
+    if d <= 4
+        return d - 1
+    v := d - 1
+    mut e := 2
+    while v.shr(e + 1) > 0
+        e += 1
+    4 + (e - 2) * 2 + v.shr(e - 1).bit_and(1)
+
+fn dist_extra(code int) int
+    if code < 4 then 0 else (code - 4) / 2 + 1
+
+fn dist_base(code int) int
+    if code < 4
+        return code + 1
+    e := (code - 4) / 2 + 2
+    (2 + (code - 4) % 2).shl(e - 1) + 1
+
+## Code lengths (at most TBITS) for the frequencies, deterministic: pairs of the
+## smallest weights are joined, ties by lower index; when a code comes out longer
+## than TBITS the frequencies are halved (rounding up) and the tree rebuilt.
+fn code_lengths(freq List[int]) List[int]
+    n := freq.len()
+    mut f := [x for x in freq]
+    mut used := 0
+    for x in f
+        if x > 0
+            used += 1
+    mut lens := [0 for _ in 0..n]
+    if used == 0
+        return lens
+    if used == 1
+        for i in 0..n
+            if f[i] > 0
+                lens[i] = 1
+        return lens
+    while true
+        # nodes 0..n-1 are symbols, n.. are joins; parent[k] links up
+        mut w := [x for x in f]
+        mut parent := [-1 for _ in 0..2 * n]
+        mut alive := [x > 0 for x in f]
+        mut count := used
+        mut next := n
+        while count > 1
+            mut a := -1
+            mut b := -1
+            for i in 0..next
+                if alive[i]
+                    if a < 0 or w[i] < w[a]
+                        b = a
+                        a = i
+                    elif b < 0 or w[i] < w[b]
+                        b = i
+            alive[a] = false
+            alive[b] = false
+            w.push(w[a] + w[b])
+            alive.push(true)
+            parent[a] = next
+            parent[b] = next
+            next += 1
+            count -= 1
+        mut too_long := false
+        for i in 0..n
+            if f[i] > 0
+                mut d := 0
+                mut k := i
+                while parent[k] >= 0
+                    k = parent[k]
+                    d += 1
+                lens[i] = d
+                if d > TBITS
+                    too_long = true
+        if not too_long
+            return lens
+        for i in 0..n
+            if f[i] > 0
+                f[i] = (f[i] + 1) / 2
+    lens
+
+fn reverse(code int, len int) int
+    mut r := 0
+    mut c := code
+    for _ in 0..len
+        r = r.shl(1).bit_or(c.bit_and(1))
+        c = c.shr(1)
+    r
+
+## Canonical codes from lengths, bit-reversed for the little-endian stream.
+fn codes_of(lens List[int]) List[int]
+    mut count := [0 for _ in 0..TBITS + 1]
+    for l in lens
+        count[l] += 1
+    count[0] = 0
+    mut next := [0 for _ in 0..TBITS + 2]
+    mut code := 0
+    for l in 1..TBITS + 1
+        code = (code + count[l - 1]).shl(1)
+        next[l] = code
+    mut out := [0 for _ in 0..lens.len()]
+    for i in 0..lens.len()
+        l := lens[i]
+        if l > 0
+            out[i] = reverse(next[l], l)
+            next[l] += 1
+    out
+
+## The decode table: entry = symbol * 16 + length at every index whose low bits are the code.
+fn table_of(lens List[int]) List[int]
+    codes := codes_of(lens)
+    mut t := [0 for _ in 0..TSIZE]
+    for i in 0..lens.len()
+        l := lens[i]
+        if l > 0
+            step := (1).shl(l)
+            mut k := codes[i]
+            while k < TSIZE
+                t[k] = i * 16 + l
+                k += step
+    t
+
+struct Bits
+    out List[u8]
+    acc int
+    n int
+
+fn Bits.put(mut self, v int, k int)
+    acc = acc.bit_or(v.shl(n))
+    n += k
+    while n >= 8
+        out.push(acc.bit_and(255).to_u8())
+        acc = acc.shr(8)
+        n -= 8
+
+fn Bits.finish(mut self)
+    if n > 0
+        out.push(acc.bit_and(255).to_u8())
+        acc = 0
+        n = 0
+
+fn hash4(d List[u8], pos int) int
+    v := d[pos].to_int()
+        + d[pos + 1].to_int().shl(8)
+        + d[pos + 2].to_int().shl(16)
+        + d[pos + 3].to_int().shl(24)
+    (v * 789008181).shr(32 - HBITS).bit_and((1).shl(HBITS) - 1)
+
+fn match_len(d List[u8], a int, b int, limit int) int
+    mut k := 0
+    while k < limit and d[a + k] == d[b + k]
+        k += 1
+    k
+
+## The longest earlier match at `pos` (length, distance); length 0 when under MINLEN.
+fn find(d List[u8], head List[int], prev List[int], pos int, n int, depth int)(int, int)
+    if pos + MINLEN > n
+        return (0, 0)
+    limit := MAXLEN.min(n - pos)
+    mut best := 0
+    mut bd := 0
+    mut cand := head[hash4(d, pos)]
+    mut tries := depth
+    while cand > 0 and tries > 0
+        c := cand - 1
+        if pos - c > WINDOW
+            break
+        if d[c + best] == d[pos + best]
+            l := match_len(d, c, pos, limit)
+            if l > best
+                best = l
+                bd = pos - c
+                if l >= limit
+                    break
+        cand = prev[c]
+        tries -= 1
+    if best < MINLEN then (0, 0) else (best, bd)
+
+fn insert(mut head List[int], mut prev List[int], d List[u8], pos int, n int)
+    if pos + MINLEN <= n
+        h := hash4(d, pos)
+        prev[pos] = head[h]
+        head[h] = pos + 1
+
+## Compresses `d` into a self-contained block. `depth` is the hash chain length
+## (8 for the fast mode).
+pub fn compress(d List[u8], depth int) List[u8]
+    n := d.len()
+    mut head := [0 for _ in 0..(1).shl(HBITS)]
+    mut prev := [0 for _ in 0..n]
+    # tokens: a literal is its byte, a match is 256 + (len - MINLEN) with the distance beside it
+    mut toks := List[int]()
+    mut dists := List[int]()
+    mut pos := 0
+    while pos < n
+        t := find(d, head, prev, pos, n, depth)
+        l := t.0
+        dd := t.1
+        if l == 0
+            toks.push(d[pos].to_int())
+            dists.push(0)
+            insert(mut head, mut prev, d, pos, n)
+            pos += 1
+            continue
+        # lazy: a longer match one byte later wins
+        insert(mut head, mut prev, d, pos, n)
+        mut ml := l
+        mut md := dd
+        if pos + 1 < n and l < 32
+            t2 := find(d, head, prev, pos + 1, n, depth)
+            if t2.0 > l + 1
+                toks.push(d[pos].to_int())
+                dists.push(0)
+                pos += 1
+                insert(mut head, mut prev, d, pos, n)
+                ml = t2.0
+                md = t2.1
+        toks.push(256 + ml - MINLEN)
+        dists.push(md)
+        for k in 1..ml
+            insert(mut head, mut prev, d, pos + k, n)
+        pos += ml
+    # frequencies, codes
+    mut flit := [0 for _ in 0..NLIT]
+    mut fdist := [0 for _ in 0..NDIST]
+    flit[EOB] = 1
+    for i in 0..toks.len()
+        t := toks[i]
+        if t < 256
+            flit[t] += 1
+        else
+            flit[257 + len_code(t - 256)] += 1
+            fdist[dist_code(dists[i])] += 1
+    llens := code_lengths(flit)
+    dlens := code_lengths(fdist)
+    lcodes := codes_of(llens)
+    dcodes := codes_of(dlens)
+    mut out := List[u8]()
+    for i in 0..(NLIT + NDIST + 1) / 2
+        a := if i * 2 < NLIT then llens[i * 2] else dlens[i * 2 - NLIT]
+        j := i * 2 + 1
+        b := if j < NLIT then llens[j] else if j < NLIT + NDIST then dlens[j - NLIT] else 0
+        out.push((a + b.shl(4)).to_u8())
+    mut w := Bits(out: out, acc: 0, n: 0)
+    for i in 0..toks.len()
+        t := toks[i]
+        if t < 256
+            w.put(lcodes[t], llens[t])
+        else
+            v := t - 256
+            lc := len_code(v)
+            w.put(lcodes[257 + lc], llens[257 + lc])
+            w.put(v - len_base(lc), len_extra(lc))
+            dc := dist_code(dists[i])
+            w.put(dcodes[dc], dlens[dc])
+            w.put(dists[i] - dist_base(dc), dist_extra(dc))
+    w.put(lcodes[EOB], llens[EOB])
+    w.finish()
+    w.out
+
+## Decodes `n` bytes of a block made by `compress`; a damaged block gives an empty
+## list (the caller checks the length and the CRC).
+pub fn decompress(src List[u8], n int) List[u8]
+    hdr := (NLIT + NDIST + 1) / 2
+    if src.len() < hdr + 1
+        return []
+    mut llens := [0 for _ in 0..NLIT]
+    mut dlens := [0 for _ in 0..NDIST]
+    for i in 0..NLIT + NDIST
+        v := src[i / 2].to_int()
+        l := if i % 2 == 0 then v.bit_and(15) else v.shr(4)
+        if i < NLIT
+            llens[i] = l
+        else
+            dlens[i - NLIT] = l
+    lt := table_of(llens)
+    dt := table_of(dlens)
+    mut out := [(0).to_u8() for _ in 0..n]
+    mut p := hdr
+    mut acc := 0
+    mut nb := 0
+    mut o := 0
+    end := src.len()
+    while true
+        # refill to more than 48 bits: a symbol, its extra bits, a slot and its extra bits
+        while nb <= 48
+            if p < end
+                acc = acc.bit_or(src[p].to_int().shl(nb))
+                p += 1
+            nb += 8
+        e := lt[acc.bit_and(TSIZE - 1)]
+        l := e.bit_and(15)
+        if l == 0
+            return []
+        acc = acc.shr(l)
+        nb -= l
+        sym := e.shr(4)
+        if sym < 256
+            if o >= n
+                return []
+            out[o] = sym.to_u8()
+            o += 1
+            continue
+        if sym == EOB
+            break
+        lc := sym - 257
+        if lc >= 32
+            return []
+        k := len_extra(lc)
+        ml := MINLEN + len_base(lc) + acc.bit_and((1).shl(k) - 1)
+        acc = acc.shr(k)
+        nb -= k
+        de := dt[acc.bit_and(TSIZE - 1)]
+        dl := de.bit_and(15)
+        if dl == 0
+            return []
+        acc = acc.shr(dl)
+        nb -= dl
+        dc := de.shr(4)
+        if dc >= NDIST
+            return []
+        dk := dist_extra(dc)
+        dist := dist_base(dc) + acc.bit_and((1).shl(dk) - 1)
+        acc = acc.shr(dk)
+        nb -= dk
+        if dist > o or o + ml > n
+            return []
+        at := o - dist
+        if dist >= ml
+            for i in 0..ml
+                out[o + i] = out[at + i]
+        else
+            for i in 0..ml
+                out[o + i] = out[at + i]
+        o += ml
+    if o != n then [] else out
+
+fn sample(n int, seed int) List[u8]
+    mut xs := List[u8]()
+    mut x := seed
+    for i in 0..n
+        x = (x * 1103515245 + 12345).bit_and(2147483647)
+        v := if i % 3 == 0 then x.shr(16).bit_and(255) else 97 + (i / 7) % 13
+        xs.push(v.to_u8())
+    xs
+
+@test fn length_and_distance_codes_invert()
+    for v in 0..MAXLEN - MINLEN + 1
+        c := len_code(v)
+        assert(c < 32)
+        assert(v >= len_base(c) and v - len_base(c) < (1).shl(len_extra(c)))
+    for d in [1, 2, 3, 4, 5, 6, 7, 8, 9, 100, 1000, 65535, 65536, 1048575, 1048576]
+        c := dist_code(d)
+        assert(c < NDIST)
+        assert(d >= dist_base(c) and d - dist_base(c) < (1).shl(dist_extra(c)))
+
+@test fn roundtrips_text_and_noise()
+    for seed in [1, 2, 3]
+        d := sample(50000, seed)
+        c := compress(d, 8)
+        assert(c.len() < d.len())
+        assert_eq(decompress(c, d.len()), d)
+    mut words := List[u8]()
+    for i in 0..4000
+        words.extend("word{i % 37} and more text ".to_bytes().to_list())
+    assert_eq(decompress(compress(words, 8), words.len()), words)
+    for n in 0..9
+        d := [(7).to_u8() for _ in 0..n]
+        assert_eq(decompress(compress(d, 8), n), d)
+    mut run := [(0).to_u8() for _ in 0..100000]
+    assert(compress(run, 8).len() < 1000)
+    assert_eq(decompress(compress(run, 8), run.len()), run)
+
+@test fn one_symbol_alphabets_decode()
+    d := [(65).to_u8() for _ in 0..3]
+    assert_eq(decompress(compress(d, 8), 3), d)
+
+@test fn damaged_blocks_are_refused()
+    d := sample(3000, 5)
+    c := compress(d, 8)
+    assert_eq(decompress(c[0..c.len() / 2], d.len()).len(), 0)
+    assert_eq(decompress(c, d.len() + 1).len(), 0)

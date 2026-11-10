@@ -29,7 +29,7 @@ echo "| corpus | tool | bytes | ratio | compress s | decompress s | peak MB |"
 echo "|---|---|---:|---:|---:|---:|---:|"
 for f in "$c"/*; do
   name=$(basename "$f"); size=$(wc -c <"$f")
-  for m in fast opt max; do
+  for m in fast lz opt max; do
     s=$(date +%s%N)
     $tm $tmflag "$tmp/clove" a -m $m -b 4096 "$tmp/a.clove" "$f" >/dev/null 2>"$tmp/t1"
     e=$(date +%s%N)
