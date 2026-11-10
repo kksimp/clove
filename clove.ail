@@ -20,10 +20,12 @@
 use cm
 use crc
 use exe
+use fast
 use lz
+use probe
 use search
 
-MAGIC := b"CLV2"
+MAGIC := b"CLV3"
 ## Blocks per `par for`. The runtime runs a loop on the pool only when it has at least
 ## twice as many iterations as cores (rt.par_worth), so this must exceed 2x any core count.
 BATCH := 64
@@ -31,12 +33,15 @@ BLOCK_FAST := 1048576
 BLOCK_MAX := 4194304
 MAX_BLOCK := 1073741824
 MAX_SIZE := 281474976710656
+HEAD := 24
+FILE_FIXED := 31
+BLOCK_ENT := 17
 
 USAGE := """
     usage: clove COMMAND ...
       a [-m fast|opt|max] [-b BLOCK_KB] ARCHIVE PATH...
-                                        add (fast: LZ, 1 MB blocks; opt: LZ parsed optimally, same
-                                        decode speed; max: context mixing, 4 MB blocks)
+                                        add (fast: LZ + Huffman, 1 MB blocks; opt: LZ parsed
+                                        optimally, range coded; max: context mixing, 4 MB blocks)
       x ARCHIVE [DIR]                   extract into DIR (default .)
       l [--json] ARCHIVE                list
       t [--json] ARCHIVE                test every block
@@ -53,14 +58,25 @@ error enum CloveError
     Usage(text str) "error[clove.usage]: {text}"
     Bad(why str) "error[clove.format]: bad archive: {why}"
 
+## One entry of the index. The files' bytes follow each other in index order as one
+## stream (solid: a small file shares its block with its neighbours, so the model is
+## warm), and `off` is where the entry's bytes start in it. `kind`: 0 file, 1 directory
+## (no bytes), 2 symbolic link (the bytes are the target). `nl0` is the newlines of the
+## stream between the start of the file's first block and `off`; `nls` the newlines
+## in the file; both let `grep` and `describe` number lines without decoding more.
 struct FileEnt
     name str
+    kind int
     size int
-    first int
-    nb int
+    off int
+    mode int
+    mtime int
+    nl0 int
+    nls int
 
 struct Archive
     bsize int
+    total int
     files List[FileEnt]
     offs List[int]
     clens List[int]
@@ -72,6 +88,7 @@ struct Packed
     clens List[int]
     crcs List[int]
     engines List[int]
+    index List[int]
 
 fn to_ints(b bytes) List[int]
     mut out := List[int]()
@@ -94,50 +111,70 @@ fn rd(b bytes, pos int, nbytes int) int ! CloveError
         v += b[pos + i].to_int().shl(8 * i)
     v
 
+## The codec byte of an engine: cm 1, lz 2 (levels 5 and 9), fast 3.
+fn codec_of(engine int) int
+    if engine == 1 then 1 else if engine == 4 then 3 else 2
+
 fn nblocks(size int, bsize int) int
     (size + bsize - 1) / bsize
 
 fn raw_len(size int, bsize int, i int) int
     bsize.min(size - i * bsize)
 
-## Compresses `data` block by block (a block that does not shrink is stored).
-## The engine byte: the codec in the low 4 bits (0 stored, 1 cm, 2 lz) and the
+## Compresses `data` block by block (a block that looks incompressible, probe.ail,
+## or that does not shrink, is stored) and builds each block's search entry.
+## The engine byte: the codec in the low 4 bits (0 stored, 1 cm, 2 lz, 3 fast) and the
 ## executable filter in the next 2 (0 none, 1 x86-64, 2 ARM64; never on stored blocks).
-## `engine` is 1 (max: cm), 2 (fast: lz level 5) or 3 (opt: lz level 9, coded as lz).
-fn pack(data bytes, bsize int, engine int) Packed
+## `engine` is 1 (max: cm), 2 (lz level 5), 3 (opt: lz level 9, coded as lz) or 4 (fast).
+## `kinds[i]` is the executable filter for block i (the kind of the file at its first byte).
+fn pack(data bytes, bsize int, engine int, kinds List[int]) Packed
     nb := nblocks(data.len(), bsize)
-    kind := exe.detect(data)
     mut parts := [List[u8]() for _ in 0..nb]
     mut crcs := [0 for _ in 0..nb]
+    mut ents := [List[int]() for _ in 0..nb]
     mut all := b""
     mut first := 0
     while first < nb
         last := (first + BATCH).min(nb)
         par for i in first..last
             s := i * bsize
-            raw := data[s..(s + bsize).min(data.len())]
+            e := (s + bsize).min(data.len())
+            raw := data[s..e]
             blk := raw.to_list()
+            kind := kinds[i]
             crcs[i] = crc.crc32(blk)
-            src := if kind == 0 then blk else exe.filter(blk, kind, true)
-            c := if engine == 1 then cm.compress(src, kind) else lz.compress(
-                src,
-                if engine == 3 then 9 else 5,
-            )
-            parts[i] = if c.len() < blk.len() then c else blk
+            ents[i] = search.entry(data, s, e)
+            if probe.incompressible(blk)
+                parts[i] = blk
+            else
+                src := if kind == 0 then blk else exe.filter(blk, kind, true)
+                mut c := src
+                if engine == 1
+                    c = cm.compress(src, kind)
+                elif engine == 4
+                    c = fast.compress(src, 8)
+                else
+                    c = lz.compress(src, if engine == 3 then 9 else 5)
+                parts[i] = if c.len() < blk.len() then c else blk
         for i in first..last
             all = all + bytes.from_list(parts[i])
         first = last
     clens := [q.len() for q in parts]
     engines := [
-        if clens[i] == raw_len(data.len(), bsize, i) then 0 else engine.min(2) + kind.shl(4)
+        if clens[i] == raw_len(data.len(), bsize, i) then 0 else codec_of(engine) + kinds[i].shl(4)
         for i in 0..nb
     ]
-    Packed(data: all, clens: clens, crcs: crcs, engines: engines)
+    mut index := List[int]()
+    for e in ents
+        index.extend(e)
+    Packed(data: all, clens: clens, crcs: crcs, engines: engines, index: index)
 
-## Decodes blocks `first..last` (positions in the arrays) on all cores; a block that
-## fails its length or CRC check comes back empty.
+## Decodes blocks `first..last` (positions in the arrays) on all cores; `data` holds
+## the archive bytes from archive offset `base`. A block that fails its length or CRC
+## check comes back empty.
 fn decode(
     data bytes,
+    base int,
     offs List[int],
     clens List[int],
     engines List[int],
@@ -151,7 +188,7 @@ fn decode(
     # constructor calls, and no method that changes a captured value; anything else runs
     # the loop on one core.
     par for i in first..last
-        part := data[offs[i]..offs[i] + clens[i]]
+        part := data[offs[i] - base..offs[i] - base + clens[i]]
         comp := part.to_list()
         kind := engines[i].shr(4)
         codec := engines[i].bit_and(15)
@@ -160,140 +197,172 @@ fn decode(
             dec = cm.decompress(comp, rawlens[i], kind)
         elif codec == 2
             dec = lz.decompress(comp, rawlens[i])
+        elif codec == 3
+            dec = fast.decompress(comp, rawlens[i])
         raw := if kind == 0 then dec else exe.filter(dec, kind, false)
         if raw.len() == rawlens[i] and crc.crc32(raw) == crcs[i]
             out[i] = raw
     out
 
-## Decodes and checks the given blocks, batch by batch on all cores; unless dest is "",
-## the data is appended to dest.
-fn unpack(
-    name str,
-    data bytes,
-    offs List[int],
-    clens List[int],
-    engines List[int],
-    crcs List[int],
-    rawlens List[int],
-    dest str,
-) ! CloveError | fs.IoError
-    if dest != ""
-        fs.write_bytes(dest, b"")?
-    mut first := 0
-    while first < clens.len()
-        last := (first + BATCH).min(clens.len())
-        out := decode(data, offs, clens, engines, crcs, rawlens, first, last)
-        for i in first..last
-            if out[i].len() != rawlens[i]
-                return Bad(why: "{name}: block {i} is damaged")
-            if dest != ""
-                fs.append_bytes(dest, bytes.from_list(out[i]))?
-        first = last
+## The raw length of every block of a stream of `total` bytes.
+fn rawlens_of(total int, bsize int) List[int]
+    [raw_len(total, bsize, i) for i in 0..nblocks(total, bsize)]
 
-## Reads and validates the index. Every field is range-checked before use, so a
+## Reads the archive bytes `lo..hi`.
+fn part_of(archive str, lo int, hi int) bytes ! fs.IoError
+    fs.read_range(archive, lo, hi - lo)?
+
+## Decodes and checks blocks `lo..hi` (at most one batch) of the archive on all
+## cores, reading only their bytes.
+fn batch_decode(archive str, a Archive, lo int, hi int) List[List[u8]] ! CloveError | fs.IoError
+    rl := rawlens_of(a.total, a.bsize)
+    base := a.offs[lo]
+    end := a.offs[hi - 1] + a.clens[hi - 1]
+    data := part_of(archive, base, end)?
+    if data.len() < end - base
+        return Bad(why: "the archive ends inside block {hi - 1}")
+    out := decode(data, base, a.offs, a.clens, a.engines, a.crcs, rl, lo, hi)
+    for i in lo..hi
+        if out[i].len() != rl[i]
+            return Bad(why: "block {i} is damaged")
+    out
+
+## Reads and validates the index from the front of the archive, growing the read
+## until the whole index is in. Every field is range-checked before use, so a
 ## damaged archive gives a `clove.format` error, never a trap.
+fn load_archive(path str) Archive ! CloveError | fs.IoError
+    mut want := 65536
+    while true
+        b := fs.read_range(path, 0, want)?
+        a := parse_archive(b, path) else err
+            # A truncation error on a partial read: read more, unless the file ended.
+            if b.len() < want
+                return err
+            want = want * 4
+            continue
+        return a
+    return Bad(why: "unreachable")
+
 fn parse_archive(b bytes, path str) Archive ! CloveError
-    if b.len() < 16 or b[0..4] != MAGIC
-        return Bad(why: "{path} is not a CLV2 archive")
+    if b.len() < HEAD or b[0..4] != MAGIC
+        return Bad(why: "{path} is not a CLV3 archive")
     nfiles := rd(b, 4, 4)?
     nblk := rd(b, 8, 4)?
     bsize := rd(b, 12, 4)?
+    total := rd(b, 16, 8)?
     if bsize < 4096 or bsize > MAX_BLOCK
         return Bad(why: "block size {bsize} is outside 4 KB..1 GB")
-    if 16 + nfiles * 18 + nblk * 17 > b.len()
-        return Bad(why: "index claims {nfiles} files and {nblk} blocks, more than the archive holds")
-    mut p := 16
+    if total > MAX_SIZE or nblk != nblocks(total, bsize)
+        return Bad(why: "{nblk} blocks of {bsize} bytes do not cover a stream of {total} bytes")
+    mut p := HEAD
     mut files := List[FileEnt]()
-    mut total := 0
+    mut off := 0
     for _ in 0..nfiles
         nlen := rd(b, p, 2)?
-        if p + 18 + nlen > b.len()
-            return Bad(why: "truncated file entry at byte {p}")
+        if p + FILE_FIXED + nlen > b.len()
+            return Bad(why: "truncated at byte {p}")
         name := b[p + 2..p + 2 + nlen].to_str() else return Bad(why: "file name at byte {p} is not UTF-8")
-        size := rd(b, p + 2 + nlen, 8)?
-        first := rd(b, p + 10 + nlen, 4)?
-        nb := rd(b, p + 14 + nlen, 4)?
-        if size > MAX_SIZE
-            return Bad(why: "{name}: declared size {size} is too large")
-        if first != total or nb != nblocks(size, bsize) or total + nb > nblk
-            return Bad(why: "{name}: block range")
-        files.push(FileEnt(name: name, size: size, first: first, nb: nb))
-        total += nb
-        p += 18 + nlen
-    if total != nblk
-        return Bad(why: "files cover {total} blocks, the index has {nblk}")
-    if p + nblk * 17 > b.len()
-        return Bad(why: "truncated block index")
-    dstart := p + nblk * 17
+        q := p + 2 + nlen
+        kind := rd(b, q, 1)?
+        size := rd(b, q + 1, 8)?
+        mode := rd(b, q + 9, 4)?
+        mtime := rd(b, q + 13, 8)?
+        nl0 := rd(b, q + 21, 4)?
+        nls := rd(b, q + 25, 4)?
+        if kind > 2 or (kind == 1 and size != 0) or size > total - off
+            return Bad(why: "{name}: kind {kind} with {size} bytes at {off} of {total}")
+        files.push(FileEnt(
+            name: name,
+            kind: kind,
+            size: size,
+            off: off,
+            mode: mode,
+            mtime: mtime,
+            nl0: nl0,
+            nls: nls,
+        ))
+        off += size
+        p += FILE_FIXED + nlen
+    if off != total
+        return Bad(why: "files hold {off} bytes, the stream {total}")
+    if p + nblk * BLOCK_ENT > b.len()
+        return Bad(why: "truncated at byte {p}")
+    dstart := p + nblk * BLOCK_ENT
     mut offs := List[int]()
     mut clens := List[int]()
     mut crcs := List[int]()
     mut engines := List[int]()
     mut next := 0
-    for f in files
-        for k in 0..f.nb
-            rel := rd(b, p, 8)?
-            clen := rd(b, p + 8, 4)?
-            eng := rd(b, p + 16, 1)?
-            raw := raw_len(f.size, bsize, k)
-            if rel != next
-                return Bad(why: "{f.name}: block {k} is not where the index says")
-            codec := eng.bit_and(15)
-            if codec > 2
-                or eng.shr(4) > 2
-                or (codec == 0 and eng != 0)
-                or clen < 1
-                or clen > raw
-                or (codec == 0) != (clen == raw)
-                return Bad(why: "{f.name}: block {k} has engine {eng} and length {clen} for {raw} bytes")
-            if dstart + rel + clen > b.len()
-                return Bad(why: "{f.name}: block {k} runs past the end of the archive")
-            offs.push(dstart + rel)
-            clens.push(clen)
-            crcs.push(rd(b, p + 12, 4)?)
-            engines.push(eng)
-            next += clen
-            p += 17
-    Archive(bsize: bsize, files: files, offs: offs, clens: clens, crcs: crcs, engines: engines)
+    for k in 0..nblk
+        rel := rd(b, p, 8)?
+        clen := rd(b, p + 8, 4)?
+        eng := rd(b, p + 16, 1)?
+        raw := raw_len(total, bsize, k)
+        if rel != next
+            return Bad(why: "block {k} is not where the index says")
+        codec := eng.bit_and(15)
+        if codec > 3
+            or eng.shr(4) > 2
+            or (codec == 0 and eng != 0)
+            or clen < 1
+            or clen > raw
+            or (codec == 0) != (clen == raw)
+            return Bad(why: "block {k} has engine {eng} and length {clen} for {raw} bytes")
+        offs.push(dstart + rel)
+        clens.push(clen)
+        crcs.push(rd(b, p + 12, 4)?)
+        engines.push(eng)
+        next += clen
+        p += BLOCK_ENT
+    Archive(
+        bsize: bsize,
+        total: total,
+        files: files,
+        offs: offs,
+        clens: clens,
+        crcs: crcs,
+        engines: engines,
+    )
 
-## The arrays of one file's blocks, so `unpack` and `read` can work on a slice.
-fn slice(xs List[int], first int, nb int) List[int]
-    xs[first..first + nb]
+## The blocks a file's bytes lie in: `b0..b1`.
+fn first_block(f FileEnt, bsize int) int
+    f.off / bsize
 
-fn file_rawlens(a Archive, f FileEnt) List[int]
-    [raw_len(f.size, a.bsize, i) for i in 0..f.nb]
+fn end_block(f FileEnt, bsize int) int
+    if f.size == 0 then first_block(f, bsize) else (f.off + f.size - 1) / bsize + 1
 
-fn header_bytes(bsize int, files List[FileEnt], p Packed) bytes
+fn header_bytes(
+    bsize int,
+    total int,
+    files List[FileEnt],
+    clens List[int],
+    crcs List[int],
+    engines List[int],
+) bytes
     mut h := List[int]()
-    h.extend([67, 76, 86, 50])
+    h.extend([67, 76, 86, 51])
     put(mut h, files.len(), 4)
-    put(mut h, p.clens.len(), 4)
+    put(mut h, clens.len(), 4)
     put(mut h, bsize, 4)
+    put(mut h, total, 8)
     for f in files
         nbytes := f.name.to_bytes()
         put(mut h, nbytes.len(), 2)
         h.extend(to_ints(nbytes))
+        put(mut h, f.kind, 1)
         put(mut h, f.size, 8)
-        put(mut h, f.first, 4)
-        put(mut h, f.nb, 4)
+        put(mut h, f.mode, 4)
+        put(mut h, f.mtime, 8)
+        put(mut h, f.nl0, 4)
+        put(mut h, f.nls, 4)
     mut off := 0
-    for i in 0..p.clens.len()
+    for i in 0..clens.len()
         put(mut h, off, 8)
-        put(mut h, p.clens[i], 4)
-        put(mut h, p.crcs[i], 4)
-        put(mut h, p.engines[i], 1)
-        off += p.clens[i]
+        put(mut h, clens[i], 4)
+        put(mut h, crcs[i], 4)
+        put(mut h, engines[i], 1)
+        off += clens[i]
     to_bytes(h)
-
-fn collect(paths List[str]) List[str] ! fs.IoError
-    mut files := List[str]()
-    for p in paths
-        if fs.metadata(p)?.is_dir
-            for f in fs.walk(p)?.sorted()
-                files.push(f)
-        else
-            files.push(p)
-    files
 
 ## A stored name may only name a path inside the extraction directory, on every
 ## platform: relative, "/"-separated, no "." or ".." or empty parts, no
@@ -318,132 +387,279 @@ fn stored_name(path str) str
         s = s.slice(if s.starts_with("/") then 1 else 2, s.len())
     s
 
-## The trailer entries of one file's blocks, one block per core.
-fn index_file(data bytes, bsize int) List[int]
-    nb := nblocks(data.len(), bsize)
-    mut parts := [List[int]() for _ in 0..nb]
-    par for i in 0..nb
-        parts[i] = search.entry(data, i * bsize, (i * bsize + bsize).min(data.len()))
-    mut all := List[int]()
-    for p in parts
-        all.extend(p)
-    all
+## A path to add, with what `collect` learned about it.
+struct Item
+    path str
+    name str
+    kind int
+    size int
+    mtime int
+
+## The directories, then the files sorted by extension and name, as 7-Zip orders a
+## solid archive, so files alike share blocks. Links are not stored yet (skipped with
+## a note), until AIL can read and make them.
+fn collect(paths List[str]) List[Item] ! CloveError | fs.IoError
+    mut dirs := List[Item]()
+    mut files := List[Item]()
+    for p in paths
+        m := fs.metadata(p)?
+        if m.is_dir
+            dirs.push(Item(path: p, name: stored_name(p), kind: 1, size: 0, mtime: m.modified_ms))
+            for e in fs.scan(p, false)?.entries
+                if e.is_link
+                    io.eprint("clove: skipping the link {e.path}")
+                elif e.is_dir
+                    dirs.push(Item(
+                        path: e.path,
+                        name: stored_name(e.path),
+                        kind: 1,
+                        size: 0,
+                        mtime: e.modified_ms,
+                    ))
+                else
+                    files.push(Item(
+                        path: e.path,
+                        name: stored_name(e.path),
+                        kind: 0,
+                        size: e.size,
+                        mtime: e.modified_ms,
+                    ))
+        else
+            files.push(Item(
+                path: p,
+                name: stored_name(p),
+                kind: 0,
+                size: m.size,
+                mtime: m.modified_ms,
+            ))
+    for it in dirs
+        if not safe(it.name)
+            return Usage(text: "refusing the name {it.path}")
+    for it in files
+        if not safe(it.name)
+            return Usage(text: "refusing the name {it.path}")
+    mut out := dirs.sorted(by: |d| d.name)
+    out.extend(files.sorted(by: |f| (path.ext(f.name), f.name)))
+    out
+
+## Builds the stream: files are read in block-sized pieces and packed a batch of
+## blocks at a time, so memory stays at one batch whatever the input size.
+struct Writer
+    tmp str
+    bsize int
+    engine int
+    buf List[u8]
+    pos int
+    flushed int
+    kinds List[int]
+    nl_run int
+    clens List[int]
+    crcs List[int]
+    engines List[int]
+    index List[int]
+
+## Packs the whole blocks in `buf` (all of it when `last`).
+fn Writer.flush(mut self, last bool) ! fs.IoError
+    whole := buf.len() / bsize * bsize
+    n := if last then buf.len() else whole
+    if n == 0
+        return
+    data := bytes.from_list(buf[0..n])
+    nb := nblocks(n, bsize)
+    p := pack(data, bsize, engine, kinds[0..nb])
+    fs.append_bytes(tmp, p.data)?
+    clens.extend(p.clens)
+    crcs.extend(p.crcs)
+    engines.extend(p.engines)
+    index.extend(p.index)
+    buf = buf[n..buf.len()]
+    kinds = kinds[nb..kinds.len()]
+    flushed += n
+
+## Appends one piece of a file whose executable kind is `kind`; returns its newlines.
+fn Writer.add(mut self, piece bytes, kind int) int ! fs.IoError
+    mut nl := 0
+    for i in 0..piece.len()
+        if (pos + i) % bsize == 0
+            kinds.push(kind)
+            nl_run = 0
+        if piece[i] == 10
+            nl += 1
+            nl_run += 1
+    buf.extend(piece.to_list())
+    pos += piece.len()
+    if buf.len() >= BATCH * bsize
+        flush(false)?
+    nl
 
 fn cmd_add(archive str, paths List[str], bsize int, engine int) ! CloveError | fs.IoError
-    files := collect(paths)?
+    items := collect(paths)?
     tmp := "{archive}.tmp"
     fs.write_bytes(tmp, b"")?
+    mut w := Writer(
+        tmp: tmp,
+        bsize: bsize,
+        engine: engine,
+        buf: [],
+        pos: 0,
+        flushed: 0,
+        kinds: [],
+        nl_run: 0,
+        clens: [],
+        crcs: [],
+        engines: [],
+        index: [],
+    )
     mut ents := List[FileEnt]()
-    mut all := Packed(data: b"", clens: [], crcs: [], engines: [])
-    mut total := 0
-    mut foot := List[int]()
-    for f in files
-        name := stored_name(f)
-        if not safe(name)
-            return Usage(text: "refusing the name {f}")
-        data := fs.read_bytes(f)?
-        p := pack(data, bsize, engine)
-        ents.push(FileEnt(name: name, size: data.len(), first: all.clens.len(), nb: p.clens.len()))
-        all.clens.extend(p.clens)
-        all.crcs.extend(p.crcs)
-        all.engines.extend(p.engines)
-        fs.append_bytes(tmp, p.data)?
-        foot.extend(index_file(data, bsize))
-        total += data.len()
-        print("{f}  {data.len()}")
-    fs.write_bytes(archive, header_bytes(bsize, ents, all))?
+    for it in items
+        nl0 := if w.pos % bsize == 0 then 0 else w.nl_run
+        mut f := FileEnt(
+            name: it.name,
+            kind: it.kind,
+            size: it.size,
+            off: w.pos,
+            mode: 0,
+            mtime: it.mtime,
+            nl0: nl0,
+            nls: 0,
+        )
+        if it.kind == 0
+            mut done := 0
+            mut kind := 0
+            while done < it.size
+                piece := fs.read_range(it.path, done, bsize)?
+                if piece.len() == 0
+                    return Usage(text: "{it.path} shrank while being read")
+                if done == 0
+                    kind = exe.detect(piece)
+                f.nls += w.add(piece, kind)?
+                done += piece.len()
+            print("{it.path}  {it.size}")
+        ents.push(f)
+    w.flush(true)?
+    fs.write_bytes(archive, header_bytes(bsize, w.pos, ents, w.clens, w.crcs, w.engines))?
     fs.append_bytes(archive, fs.read_bytes(tmp)?)?
-    fs.append_bytes(archive, to_bytes(search.trailer(foot)))?
+    fs.append_bytes(archive, to_bytes(search.trailer(w.index)))?
     fs.remove(tmp)?
-    print("{files.len()} files, {total} -> {fs.metadata(archive)?.size} bytes")
+    print("{ents.len()} entries, {w.pos} -> {fs.metadata(archive)?.size} bytes")
+
+fn dest_of(dir str, name str) str
+    if dir == "." then name else "{dir}/{name}"
+
+## Writes the bytes of block `i` to the files they belong to; `fi` is the first file
+## not yet finished and comes back advanced.
+fn spill(a Archive, i int, blk List[u8], dir str, fi0 int) int ! fs.IoError
+    bs := i * a.bsize
+    be := bs + blk.len()
+    mut fi := fi0
+    mut k := fi
+    while k < a.files.len() and a.files[k].off < be
+        f := a.files[k]
+        if f.kind == 0 and f.size > 0 and f.off + f.size > bs
+            lo := f.off.max(bs)
+            hi := (f.off + f.size).min(be)
+            piece := bytes.from_list(blk[lo - bs..hi - bs])
+            dest := dest_of(dir, f.name)
+            if lo == f.off
+                fs.write_bytes(dest, piece)?
+            else
+                fs.append_bytes(dest, piece)?
+        if f.off + f.size <= be
+            fi = k + 1
+        k += 1
+    fi
 
 fn cmd_extract(archive str, dir str) ! CloveError | fs.IoError
-    b := fs.read_bytes(archive)?
-    a := parse_archive(b, archive)?
+    a := load_archive(archive)?
     for f in a.files
         if not safe(f.name)
             return Bad(why: "unsafe name {f.name}")
-        dest := if dir == "." then f.name else "{dir}/{f.name}"
-        parts := dest.split("/")
-        if parts.len() > 1
-            fs.make_dir(parts[0..parts.len() - 1].join("/"))?
-        unpack(
-            f.name,
-            b,
-            slice(a.offs, f.first, f.nb),
-            slice(a.clens, f.first, f.nb),
-            slice(a.engines, f.first, f.nb),
-            slice(a.crcs, f.first, f.nb),
-            file_rawlens(a, f),
-            dest,
-        )?
+    for f in a.files
+        dest := dest_of(dir, f.name)
+        if f.kind == 1
+            fs.make_dir(dest)?
+        else
+            parts := dest.split("/")
+            if parts.len() > 1
+                fs.make_dir(parts[0..parts.len() - 1].join("/"))?
+            if f.size == 0
+                fs.write_bytes(dest, b"")?
+    mut fi := 0
+    mut lo := 0
+    while lo < a.offs.len()
+        hi := (lo + BATCH).min(a.offs.len())
+        out := batch_decode(archive, a, lo, hi)?
+        for i in lo..hi
+            fi = spill(a, i, out[i], dir, fi)?
+        lo = hi
+    for f in a.files
         print("{f.name}")
 
+## The packed bytes of a file: its share of each block it lies in.
 fn packed_of(a Archive, f FileEnt) int
     mut c := 0
-    for x in slice(a.clens, f.first, f.nb)
-        c += x
+    for g in first_block(f, a.bsize)..end_block(f, a.bsize)
+        bs := g * a.bsize
+        raw := raw_len(a.total, a.bsize, g)
+        mine := (f.off + f.size).min(bs + raw) - f.off.max(bs)
+        c += a.clens[g] * mine / raw
     c
 
 ## A JSON string literal, quotes included.
 fn js(s str) str
     Json.Str(s).to_text()
 
+fn kind_name(k int) str
+    if k == 1 then "dir" else if k == 2 then "link" else "file"
+
 fn list_json(archive str) str ! CloveError | fs.IoError
-    b := fs.read_bytes(archive)?
-    a := parse_archive(b, archive)?
+    a := load_archive(archive)?
     mut size := 0
     mut packed := 0
     mut items := List[str]()
     for f in a.files
         c := packed_of(a, f)
-        items.push("\{\"name\": {js(f.name)}, \"size\": {f.size}, \"packed\": {c}, \"blocks\": {f.nb}}")
+        items.push("\{\"name\": {js(f.name)}, \"kind\": \"{kind_name(f.kind)}\", \"size\": {f.size}, \"packed\": {c}, \"modified_ms\": {f.mtime}}")
         size += f.size
         packed += c
-    "\{\"archive\": {js(archive)}, \"block_size\": {a.bsize}, \"files\": [{items.join(", ")}], \"size\": {size}, \"packed\": {packed}}"
+    "\{\"archive\": {js(archive)}, \"block_size\": {a.bsize}, \"files\": [{items.join(", ")}], \"size\": {size}, \"packed\": {packed}, \"blocks\": {a.offs.len()}}"
 
 fn cmd_list(archive str, json bool) ! CloveError | fs.IoError
     if json
         print(list_json(archive)?)
         return
-    b := fs.read_bytes(archive)?
-    a := parse_archive(b, archive)?
+    a := load_archive(archive)?
     mut size := 0
     mut packed := 0
     for f in a.files
         c := packed_of(a, f)
-        print("{f.size:>12} {c:>12}  {f.name}")
+        print("{f.size:>12} {c:>12}  {f.name}{if f.kind == 1 then "/" else ""}")
         size += f.size
         packed += c
-    print("{size:>12} {packed:>12}  {a.files.len()} files")
+    print("{size:>12} {packed:>12}  {a.files.len()} entries in {a.offs.len()} blocks")
 
 fn cmd_test(archive str, json bool) ! CloveError | fs.IoError
-    b := fs.read_bytes(archive)?
-    a := parse_archive(b, archive)?
-    for f in a.files
-        unpack(
-            f.name,
-            b,
-            slice(a.offs, f.first, f.nb),
-            slice(a.clens, f.first, f.nb),
-            slice(a.engines, f.first, f.nb),
-            slice(a.crcs, f.first, f.nb),
-            file_rawlens(a, f),
-            "",
-        )?
+    a := load_archive(archive)?
+    mut lo := 0
+    while lo < a.offs.len()
+        hi := (lo + BATCH).min(a.offs.len())
+        batch_decode(archive, a, lo, hi)?
+        lo = hi
     if json
-        print("\{\"ok\": true, \"files\": {a.files.len()}}")
+        print("\{\"ok\": true, \"files\": {a.files.len()}, \"blocks\": {a.offs.len()}}")
     else
-        print("ok: {a.files.len()} files")
+        print("ok: {a.files.len()} entries, {a.offs.len()} blocks")
+
+fn find_file(a Archive, name str) int
+    for i in 0..a.files.len()
+        if a.files[i].name == name
+            return i
+    -1
 
 ## Bytes lo..hi of one file; only the blocks that cover them are decoded.
 fn read_part(archive str, name str, lo int, hi int) bytes ! CloveError | fs.IoError
-    b := fs.read_bytes(archive)?
-    a := parse_archive(b, archive)?
-    mut found := -1
-    for i in 0..a.files.len()
-        if a.files[i].name == name
-            found = i
+    a := load_archive(archive)?
+    found := find_file(a, name)
     if found < 0
         return Usage(text: "{name} is not in {archive}")
     f := a.files[found]
@@ -452,27 +668,18 @@ fn read_part(archive str, name str, lo int, hi int) bytes ! CloveError | fs.IoEr
         return Usage(text: "range {lo}:{end} is outside {name} ({f.size} bytes)")
     if lo == end
         return b""
-    b0 := lo / a.bsize
-    b1 := (end - 1) / a.bsize + 1
-    g0 := f.first + b0
-    cnt := b1 - b0
-    rawlens := [raw_len(f.size, a.bsize, b0 + i) for i in 0..cnt]
-    got := decode(
-        b,
-        slice(a.offs, g0, cnt),
-        slice(a.clens, g0, cnt),
-        slice(a.engines, g0, cnt),
-        slice(a.crcs, g0, cnt),
-        rawlens,
-        0,
-        cnt,
-    )
+    b0 := (f.off + lo) / a.bsize
+    b1 := (f.off + end - 1) / a.bsize + 1
     mut buf := List[u8]()
-    for i in 0..cnt
-        if got[i].len() != rawlens[i]
-            return Bad(why: "{name}: block {b0 + i} is damaged")
-        buf.extend(got[i])
-    bytes.from_list(buf[lo - b0 * a.bsize..end - b0 * a.bsize])
+    mut g0 := b0
+    while g0 < b1
+        g1 := (g0 + BATCH).min(b1)
+        out := batch_decode(archive, a, g0, g1)?
+        for i in g0..g1
+            buf.extend(out[i])
+        g0 = g1
+    s := f.off + lo - b0 * a.bsize
+    bytes.from_list(buf[s..s + end - lo])
 
 fn cmd_read(archive str, name str, lo int, hi int, out str) ! CloveError | fs.IoError
     part := read_part(archive, name, lo, hi)?
@@ -498,9 +705,35 @@ struct Found
     decoded int
     skipped int
 
+## The search trailer, read from the end of the archive; `ok` false when there is none.
+fn load_index(archive str, nblk int) search.Index ! fs.IoError
+    none_found := search.Index(ok: false, nl: [], text: [], ks: [], offs: [])
+    n := fs.metadata(archive)?.size
+    if n < 8
+        return none_found
+    tail8 := fs.read_range(archive, n - 8, 8)?
+    tlen := tail8[0].to_int()
+        + tail8[1].to_int().shl(8)
+        + tail8[2].to_int().shl(16)
+        + tail8[3].to_int().shl(24)
+    if tlen < 8 or tlen > n
+        return none_found
+    search.load(fs.read_range(archive, n - tlen, tlen)?, nblk)
+
+## The bytes of the trailer the index points into (ix.offs are offsets in it).
+fn index_bytes(archive str) bytes ! fs.IoError
+    n := fs.metadata(archive)?.size
+    tail8 := fs.read_range(archive, n - 8, 8)?
+    tlen := tail8[0].to_int()
+        + tail8[1].to_int().shl(8)
+        + tail8[2].to_int().shl(16)
+        + tail8[3].to_int().shl(24)
+    fs.read_range(archive, n - tlen, tlen)?
+
 ## Lines of `pat` in the archive's files. With the trigram trailer, only blocks whose filter
 ## can hold the text are decoded (plus the next block of a candidate, for a match that
-## crosses the boundary); without it every block is.
+## crosses the boundary); without it every block is. A file's bytes may start and end
+## inside blocks it shares with its neighbours, so hits are kept to the file's range.
 fn run_grep(
     archive str,
     pat str,
@@ -509,29 +742,33 @@ fn run_grep(
     max int,
     only str,
 ) Found ! CloveError | fs.IoError
-    b := fs.read_bytes(archive)?
-    a := parse_archive(b, archive)?
+    a := load_archive(archive)?
     pb := pat.to_bytes()
     if pb.len() == 0
         return Usage(text: "grep needs text to look for")
     if pb.len() > a.bsize
         return Usage(text: "the text is longer than the block ({a.bsize} bytes)")
-    ix := search.load(b, a.offs.len())
+    ix := load_index(archive, a.offs.len())?
+    tail := if ix.ok then index_bytes(archive)? else b""
     mut r := Found(hits: [], truncated: false, indexed: ix.ok, blocks: 0, decoded: 0, skipped: 0)
     for f in a.files
-        if only != "" and f.name != only
+        if (only != "" and f.name != only) or f.kind != 0 or f.size == 0
             continue
-        r.blocks += f.nb
-        mut cands := [j for j in 0..f.nb]
-        mut pre := [0 for _ in 0..f.nb]
+        first := first_block(f, a.bsize)
+        nb := end_block(f, a.bsize) - first
+        r.blocks += nb
+        mut cands := [j for j in 0..nb]
+        mut pre := [0 for _ in 0..nb]
         if ix.ok
-            cands = search.candidates(ix, b, f.first, f.nb, pb, binary)
+            cands = search.candidates(ix, tail, first, nb, pb, binary)
             if not binary
-                for j in 0..f.nb
-                    if ix.text[f.first + j] == 0
+                for j in 0..nb
+                    if ix.text[first + j] == 0
                         r.skipped += 1
-            for j in 1..f.nb
-                pre[j] = pre[j - 1] + ix.nl[f.first + j - 1]
+            for j in 1..nb
+                pre[j] = pre[j - 1] + ix.nl[first + j - 1]
+            for j in 1..nb
+                pre[j] -= f.nl0
         mut running := 0
         mut last_end := -1
         mut c0 := 0
@@ -541,18 +778,24 @@ fn run_grep(
             for j in cands[c0..c1]
                 if need.len() == 0 or need[need.len() - 1] < j
                     need.push(j)
-                if j + 1 < f.nb
+                if j + 1 < nb
                     need.push(j + 1)
-            mut at := [-1 for _ in 0..f.nb]
+            mut at := [-1 for _ in 0..nb]
             for t in 0..need.len()
                 at[need[t]] = t
-            rl := [raw_len(f.size, a.bsize, j) for j in need]
+            rl := [raw_len(a.total, a.bsize, first + j) for j in need]
+            gbase := a.offs[first + need[0]]
+            gend := a.offs[first + need[need.len() - 1]] + a.clens[first + need[need.len() - 1]]
+            data := part_of(archive, gbase, gend)?
+            if data.len() < gend - gbase
+                return Bad(why: "the archive ends inside block {first + need[need.len() - 1]}")
             got := decode(
-                b,
-                [a.offs[f.first + j] for j in need],
-                [a.clens[f.first + j] for j in need],
-                [a.engines[f.first + j] for j in need],
-                [a.crcs[f.first + j] for j in need],
+                data,
+                gbase,
+                [a.offs[first + j] for j in need],
+                [a.clens[first + j] for j in need],
+                [a.engines[first + j] for j in need],
+                [a.crcs[first + j] for j in need],
                 rl,
                 0,
                 need.len(),
@@ -563,29 +806,35 @@ fn run_grep(
                     return Bad(why: "{f.name}: block {need[t]} is damaged")
             for j in cands[c0..c1]
                 own := bytes.from_list(got[at[j]])
-                buf := if j + 1 < f.nb then own + bytes.from_list(got[at[j + 1]]) else own
+                buf := if j + 1 < nb then own + bytes.from_list(got[at[j + 1]]) else own
+                bs := (first + j) * a.bsize
+                # the file's bytes inside this block, and its end inside buf
+                flo := (f.off - bs).max(0)
+                fend := (f.off + f.size - bs).min(buf.len())
                 before := if ix.ok then pre[j] else running
-                mut lastp := 0
+                mut lastp := flo
                 mut nlc := 0
                 for p in search.scan(buf, own.len(), pb, fold)
+                    if p < flo or p + pb.len() > fend
+                        continue
                     if r.hits.len() >= max
                         r.truncated = true
                         break
-                    if j * a.bsize + p < last_end
+                    if bs + p < last_end
                         continue
-                    s := search.line_start(buf, p)
+                    s := search.line_start(buf, p).max(flo)
                     nlc += search.newlines(buf, lastp, s)
                     lastp = s
                     w := (p - HITTEXT / 4).max(s)
-                    e := search.line_end(buf, p)
-                    last_end = j * a.bsize + e
+                    e := search.line_end(buf, p).min(fend)
+                    last_end = bs + e
                     r.hits.push(Hit(
                         file: f.name,
                         line: before + nlc + 1,
-                        offset: j * a.bsize + p,
+                        offset: bs + p - f.off,
                         text: buf[w..e.min(w + HITTEXT)].text(),
                     ))
-                running += search.newlines(own, 0, own.len())
+                running += search.newlines(own, flo, fend.min(own.len()))
                 if r.truncated
                     break
             c0 = c1
@@ -615,42 +864,40 @@ fn cmd_grep(archive str, pat str, o Opts) ! CloveError | fs.IoError
     if r.truncated
         io.eprint("clove: stopped at {o.max} lines (--max N for more)")
 
-fn kind_of(ix search.Index, f FileEnt) str
-    if not ix.ok or f.nb == 0
+fn kind_of(ix search.Index, a Archive, f FileEnt) str
+    first := first_block(f, a.bsize)
+    nb := end_block(f, a.bsize) - first
+    if not ix.ok or nb == 0
         return "unknown"
     mut text := 0
-    for j in 0..f.nb
-        text += ix.text[f.first + j]
-    if text == f.nb
+    for j in 0..nb
+        text += ix.text[first + j]
+    if text == nb
         return "text"
     if text == 0
         return "binary"
     "mixed"
 
+## The engines of the blocks a file lies in: stored, cm, lz, fast counts.
+fn engines_of(a Archive, f FileEnt) List[int]
+    mut n := [0, 0, 0, 0]
+    for g in first_block(f, a.bsize)..end_block(f, a.bsize)
+        n[a.engines[g].bit_and(15)] += 1
+    n
+
 ## One JSON object that tells an agent what is inside before it reads anything.
 fn describe_json(archive str) str ! CloveError | fs.IoError
-    b := fs.read_bytes(archive)?
-    a := parse_archive(b, archive)?
-    ix := search.load(b, a.offs.len())
+    a := load_archive(archive)?
+    ix := load_index(archive, a.offs.len())?
     mut items := List[str]()
     mut size := 0
     mut packed := 0
     for f in a.files
-        mut nl := 0
-        mut cm_blocks := 0
-        mut lz_blocks := 0
-        mut stored := 0
-        for j in 0..f.nb
-            if ix.ok
-                nl += ix.nl[f.first + j]
-            match a.engines[f.first + j].bit_and(15)
-                0 => stored += 1
-                1 => cm_blocks += 1
-                _ => lz_blocks += 1
+        en := engines_of(a, f)
         c := packed_of(a, f)
         size += f.size
         packed += c
-        items.push("\{\"name\": {js(f.name)}, \"size\": {f.size}, \"packed\": {c}, \"blocks\": {f.nb}, \"kind\": \"{kind_of(ix, f)}\", \"newlines\": {nl}, \"engines\": \{\"stored\": {stored}, \"cm\": {cm_blocks}, \"lz\": {lz_blocks}}}")
+        items.push("\{\"name\": {js(f.name)}, \"kind\": \"{kind_name(f.kind)}\", \"size\": {f.size}, \"packed\": {c}, \"content\": \"{kind_of(ix, a, f)}\", \"newlines\": {f.nls}, \"modified_ms\": {f.mtime}, \"engines\": \{\"stored\": {en[0]}, \"cm\": {en[1]}, \"lz\": {en[2]}, \"fast\": {en[3]}}}")
     mut index_bytes := 0
     if ix.ok
         for k in ix.ks
@@ -662,16 +909,11 @@ fn cmd_describe(archive str, json bool) ! CloveError | fs.IoError
     if json
         print(describe_json(archive)?)
         return
-    b := fs.read_bytes(archive)?
-    a := parse_archive(b, archive)?
-    ix := search.load(b, a.offs.len())
+    a := load_archive(archive)?
+    ix := load_index(archive, a.offs.len())?
     for f in a.files
-        mut nl := 0
-        for j in 0..f.nb
-            if ix.ok
-                nl += ix.nl[f.first + j]
-        print("{f.size:>12} {packed_of(a, f):>12} {kind_of(ix, f):<8} {nl:>9} lines  {f.name}")
-    print("{a.files.len()} files, {a.offs.len()} blocks of {a.bsize} bytes, trigram index: {if ix.ok then "yes" else "no"}")
+        print("{f.size:>12} {packed_of(a, f):>12} {kind_of(ix, a, f):<8} {f.nls:>9} lines  {f.name}")
+    print("{a.files.len()} entries, {a.offs.len()} blocks of {a.bsize} bytes, trigram index: {if ix.ok then "yes" else "no"}")
 
 fn prop(name str, kind str) str
     "{js(name)}: \{\"type\": {js(kind)}}"
@@ -797,25 +1039,25 @@ fn mb_per_s(n int, ms int) str
 
 fn cmd_bench(path str, bsize int, engine int) ! CloveError | fs.IoError
     data := fs.read_bytes(path)?
+    nb := nblocks(data.len(), bsize)
+    kind := exe.detect(data)
     t0 := time.now_ms()
-    p := pack(data, bsize, engine)
+    p := pack(data, bsize, engine, [kind for _ in 0..nb])
     t1 := time.now_ms()
-    nb := p.clens.len()
     mut offs := List[int]()
     mut o := 0
     for c in p.clens
         offs.push(o)
         o += c
-    unpack(
-        path,
-        p.data,
-        offs,
-        p.clens,
-        p.engines,
-        p.crcs,
-        [raw_len(data.len(), bsize, i) for i in 0..nb],
-        "",
-    )?
+    rl := rawlens_of(data.len(), bsize)
+    mut first := 0
+    while first < nb
+        last := (first + BATCH).min(nb)
+        out := decode(p.data, 0, offs, p.clens, p.engines, p.crcs, rl, first, last)
+        for i in first..last
+            if out[i].len() != rl[i]
+                return Bad(why: "block {i} is damaged")
+        first = last
     t2 := time.now_ms()
     ratio := data.len().to_float() / p.data.len().max(1).to_float()
     print("{path}: {data.len()} -> {p.data.len()} bytes, ratio {ratio:.3}")
@@ -839,7 +1081,7 @@ struct Opts
 fn parse(args List[str]) Opts ! CloveError
     mut o := Opts(
         bsize: 0,
-        engine: 2,
+        engine: 4,
         json: false,
         lo: 0,
         hi: -1,
@@ -860,13 +1102,15 @@ fn parse(args List[str]) Opts ! CloveError
             i += 2
         elif a == "-m"
             if word == "fast"
+                o.engine = 4
+            elif word == "lz"
                 o.engine = 2
             elif word == "max"
                 o.engine = 1
             elif word == "opt"
                 o.engine = 3
             else
-                return Usage(text: "-m is fast, opt or max")
+                return Usage(text: "-m is fast, lz, opt or max")
             i += 2
         elif a == "--json"
             o.json = true
@@ -958,6 +1202,7 @@ fn test_bytes(n int, seed int) bytes
 
 fn make_tree(root str) ! fs.IoError
     fs.make_dir("{root}/src/deep/er")?
+    fs.make_dir("{root}/emptydir")?
     fs.write_bytes("{root}/empty.txt", b"")?
     fs.write_bytes("{root}/src/one.txt", "hello clove\n".to_bytes())?
     fs.write_bytes("{root}/src/deep/big.bin", test_bytes(70000, 7))?
@@ -967,7 +1212,7 @@ fn same_file(a str, b str) bool ! fs.IoError
     fs.read_bytes(a)? == fs.read_bytes(b)?
 
 @test fn add_extract_round_trip_both_engines()
-    for engine in [2, 1]
+    for engine in [4, 2, 1]
         root := "{TEST_DIR}/rt{engine}"
         make_tree("{root}/in")?
         arc := "{root}/t.clove"
@@ -976,6 +1221,32 @@ fn same_file(a str, b str) bool ! fs.IoError
         cmd_extract(arc, "{root}/out")?
         for f in ["empty.txt", "src/one.txt", "src/deep/big.bin", "src/deep/er/exact.bin"]
             assert(same_file("{root}/in/{f}", "{root}/out/{root}/in/{f}")?)
+        assert(fs.metadata("{root}/out/{root}/in/emptydir")?.is_dir)
+
+## Small files share blocks; grep still names the file and numbers lines from its start.
+@test fn solid_blocks_keep_files_and_line_numbers_apart()
+    root := "{TEST_DIR}/solid"
+    fs.make_dir("{root}/in")?
+    for k in 0..20
+        mut text := ""
+        for l in 0..30
+            text = "{text}file {k} line {l} {if l == k then "needle" else "hay"}\n"
+        fs.write_text("{root}/in/f{k:0>2}.txt", text)?
+    arc := "{root}/t.clove"
+    cmd_add(arc, ["{root}/in"], 4096, 2)?
+    a := load_archive(arc)?
+    assert(a.offs.len() < 20)
+    r := run_grep(arc, "needle", false, false, 100, "")?
+    assert_eq(r.hits.len(), 20)
+    for h in r.hits
+        k := h.file.slice(h.file.len() - 6, h.file.len() - 4).to_int() else 99
+        assert_eq(h.line, k + 1)
+        assert(h.text.contains("file {k} line {k} needle"))
+    cmd_extract(arc, "{root}/out")?
+    for k in 0..20
+        assert(same_file("{root}/in/f{k:0>2}.txt", "{root}/out/{root}/in/f{k:0>2}.txt")?)
+    one := read_part(arc, "{root}/in/f07.txt", 7, 20)?
+    assert_eq(one.text(), fs.read_text("{root}/in/f07.txt")?.slice(7, 20))
 
 @test fn range_reads_at_block_boundaries()
     root := "{TEST_DIR}/range"
@@ -1000,11 +1271,17 @@ fn same_file(a str, b str) bool ! fs.IoError
     a0 := parse_archive(good, "good")?
     last := a0.offs.len() - 1
     data_end := a0.offs[last] + a0.clens[last]
-    # Every cut before the end of the data is refused: the index says where each
-    # block ends (the search trailer after the data is optional).
-    for n in [0, 3, 4, 15, 16, 17, 30, 60, 100, 200, data_end / 2, data_end - 1]
-        cut := parse_archive(good[0..n], "cut") else continue
-        assert_eq(cut.files.len(), -1)
+    # A cut inside the index is refused by the parser; a cut inside the data parses
+    # (the index is read alone) and `t` reports the damage (the trailer is optional).
+    index_end0 := a0.offs[0]
+    for n in [0, 3, 4, 15, 16, 17, 30, 60, 100, 200, index_end0 - 1]
+        if n < index_end0
+            cut := parse_archive(good[0..n], "cut") else continue
+            assert_eq(cut.files.len(), -1)
+    for n in [index_end0, data_end / 2, data_end - 1]
+        fs.write_bytes("{root}/cut.clove", good[0..n])?
+        cmd_test("{root}/cut.clove", false) else continue
+        assert(false)
     # Flipping any index byte gives an error or a CRC failure, never a trap.
     index_end := a0.offs[0]
     mut flips := 0
@@ -1057,7 +1334,7 @@ fn same_file(a str, b str) bool ! fs.IoError
         ])
         prog.extend(test_bytes(3, k).to_list())
     fs.write_bytes("{root}/prog", bytes.from_list(prog))?
-    for engine in [2, 1]
+    for engine in [4, 2, 1]
         arc := "{root}/p{engine}.clove"
         cmd_add(arc, ["{root}/prog"], 4096, engine)?
         a := parse_archive(fs.read_bytes(arc)?, arc)?

@@ -1,0 +1,128 @@
+## Incompressible-block probe. A block of random or already-compressed bytes
+## gains nothing from either engine, yet coding it costs as much as any other
+## block, so `pack` asks here first. The probe samples up to eight 16 KB slices
+## spread over the block and measures two things on them: the order-0 entropy
+## (byte counts) and how many positions repeat an earlier four-byte string in
+## the slice. A block whose sample has over 7.9 bits per byte and under 3% of
+## positions with a repeat is stored as it is. Integer arithmetic only, so every
+## machine makes the same choice and the archive bytes are the same everywhere.
+
+SLICE := 16384
+SLICES := 8
+HBITS := 12
+
+## log2 of 1 + i/256 in 16.16 fixed point, by squaring: the fractional bits of
+## log2(x) for x in [1, 2) come out one per squaring, with no floating point.
+fn frac_table() List[int]
+    mut t := List[int]()
+    for i in 0..256
+        mut x := 65536 + i * 256
+        mut r := 0
+        for _ in 0..16
+            x = (x * x).shr(16)
+            r = r.shl(1)
+            if x >= 131072
+                x = x.shr(1)
+                r += 1
+        t.push(r)
+    t
+
+## log2(x) in 16.16 fixed point for x >= 1, from the position of the top bit
+## and the eight bits under it.
+fn lg(t List[int], x int) int
+    mut k := 0
+    mut v := x
+    while v >= 256
+        v = v.shr(1)
+        k += 1
+    mut m := v
+    mut j := 0
+    while m >= 2
+        m = m.shr(1)
+        j += 1
+    k += j
+    frac := if k >= 8 then x.shr(k - 8).bit_and(255) else x.shl(8 - k).bit_and(255)
+    k.shl(16) + t[frac]
+
+fn h4(d List[u8], pos int) int
+    v := d[pos].to_int()
+        + d[pos + 1].to_int().shl(8)
+        + d[pos + 2].to_int().shl(16)
+        + d[pos + 3].to_int().shl(24)
+    (v * 789008181).shr(32 - HBITS).bit_and((1).shl(HBITS) - 1)
+
+## True when the sample of `d` looks incompressible (see the file comment).
+pub fn incompressible(d List[u8]) bool
+    n := d.len()
+    if n < 4096
+        return false
+    mut counts := [0 for _ in 0..256]
+    mut heads := [0 for _ in 0..(1).shl(HBITS)]
+    mut total := 0
+    mut repeats := 0
+    whole := n <= SLICE * SLICES
+    nslices := if whole then 1 else SLICES
+    for s in 0..nslices
+        lo := if whole then 0 else (n - SLICE) * s / (SLICES - 1)
+        hi := if whole then n else lo + SLICE
+        for i in lo..hi
+            counts[d[i].to_int()] += 1
+        for i in lo..hi - 3
+            h := h4(d, i)
+            c := heads[h]
+            if c > 0
+                p := c - 1
+                if p >= lo
+                    and d[p] == d[i]
+                    and d[p + 1] == d[i + 1]
+                    and d[p + 2] == d[i + 2]
+                    and d[p + 3] == d[i + 3]
+                    repeats += 1
+            heads[h] = i + 1
+        total += hi - lo
+    t := frac_table()
+    mut bits := total * lg(t, total)
+    for c in counts
+        if c > 0
+            bits -= c * lg(t, c)
+    # 7.9 bits per byte, in 16.16: 517734 per byte
+    bits > total * 517734 and repeats * 33 < total
+
+fn noise(n int, seed int) List[u8]
+    mut xs := List[u8]()
+    mut x := seed
+    for _ in 0..n
+        x = (x * 1103515245 + 12345).bit_and(2147483647)
+        xs.push(x.shr(16).bit_and(255).to_u8())
+    xs
+
+@test fn lg_is_close_to_log2()
+    t := frac_table()
+    assert_eq(lg(t, 1), 0)
+    assert_eq(lg(t, 2), 65536)
+    assert_eq(lg(t, 1024), 655360)
+    # log2(3) = 1.58496: 103872 in 16.16
+    x := lg(t, 3)
+    assert(x > 103800 and x < 103950)
+    y := lg(t, 1000000)
+    # log2(1e6) = 19.93157: 1306235
+    assert(y > 1306000 and y < 1306500)
+
+@test fn noise_is_incompressible_and_text_is_not()
+    assert(incompressible(noise(200000, 7)))
+    assert(incompressible(noise(5000, 9)))
+    mut text := List[u8]()
+    for i in 0..3000
+        text.extend("the quick brown fox {i % 17} ".to_bytes().to_list())
+    assert(not incompressible(text))
+    # bytes with a flat histogram but long repeats: compressible by LZ
+    mut rep := noise(4096, 3)
+    for _ in 0..40
+        rep.extend(noise(4096, 3))
+    assert(not incompressible(rep))
+    # a skewed histogram with no repeats: compressible by entropy coding
+    mut skew := List[u8]()
+    for b in noise(100000, 5)
+        skew.push(b.to_int().bit_and(63).to_u8())
+    assert(not incompressible(skew))
+    assert(not incompressible(List[u8]()))
