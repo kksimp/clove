@@ -6,6 +6,8 @@
 ## so every machine makes the same choice. The result is an engine number as `pack` takes
 ## it: 0 stored, 3 opt, 4 fast.
 
+use fast
+
 SAMPLE := 32768
 STORED := 0
 OPT := 3
