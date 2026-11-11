@@ -15,7 +15,7 @@
 ## all, its linear lean. Two mixers weigh the inputs, one by the partial byte and
 ## one by the previous byte and the match state; a final two-weight mixer per bit
 ## position joins them; two SSE stages refine the result by order-0 and order-1
-## context. Each nibble bucket carries a check word, so a hash collision clears
+## context. Each nibble bucket carries a check byte, so a hash collision clears
 ## the bucket instead of mixing two contexts' histories. Table sizes grow with
 ## the block (both sides know its length), so small blocks stay cheap.
 
@@ -24,6 +24,8 @@ NIN := 19
 LIMIT := 255
 INIT := 1073741824
 NSTATES := 175
+## The history tables stop growing at 2^TCAP slots per order (a slot is one byte).
+TCAP := 22
 RUNCAP := 40
 MIXCAP := 12
 
@@ -167,7 +169,7 @@ fn apm_init(nctx int) List[u32]
     [curve[k % 33] for k in 0..nctx * 33]
 
 struct Model
-    t List[u32]
+    t List[u8]
     tbits int
     o0 List[int]
     idx List[int]
@@ -211,7 +213,7 @@ struct Model
 
 ## A model for an `n`-byte block; `exe` is the block's executable filter (0 for data).
 fn new_model(n int, exe int) Model
-    tbits := bits_for(n * 2, 12, 21)
+    tbits := bits_for(n * 2, 12, TCAP)
     mbits := bits_for(n, 10, 20)
     states := build_states()
     one_map := map_init(states)
@@ -219,7 +221,7 @@ fn new_model(n int, exe int) Model
     for _ in 0..NORD
         sm.extend(one_map)
     mut m := Model(
-        t: [(0).to_u32() for _ in 0..NORD * (1).shl(tbits)],
+        t: [(0).to_u8() for _ in 0..NORD * (1).shl(tbits)],
         tbits: tbits,
         o0: [INIT for _ in 0..256],
         idx: [0 for _ in 0..NORD],
@@ -271,9 +273,9 @@ fn new_model(n int, exe int) Model
     m
 
 ## Slots of the context models for the next bit. Each context hashes once per
-## nibble to a bucket of 16 slots (64 bytes, one cache line); the bits of the
+## nibble to a bucket of 16 one-byte slots (four buckets to a cache line); the bits of the
 ## nibble so far pick slots 1..15, so a byte costs two cache misses per context
-## instead of eight. Slot 0 holds a check word from other bits of the hash: a
+## instead of eight. Slot 0 holds a check byte from other bits of the hash: a
 ## bucket that belongs to a different context is cleared before use.
 fn Model.set_idx(mut self)
     if bitpos == 0 or bitpos == 4
@@ -281,11 +283,11 @@ fn Model.set_idx(mut self)
         for i in 0..NORD
             h := (hv[i] + c0 * 40503) * 2654435761
             bkt[i] = h.shr(20).bit_and(bmask).shl(4) + i.shl(tbits)
-            check := h.shr(44).bit_and(65535) + 1
+            check := h.shr(44).bit_and(255)
             if t[bkt[i]].to_int() != check
-                t[bkt[i]] = check.to_u32()
+                t[bkt[i]] = check.to_u8()
                 for k in 1..16
-                    t[bkt[i] + k] = (0).to_u32()
+                    t[bkt[i] + k] = (0).to_u8()
     nib := if bitpos < 4 then c0 else (1).shl(bitpos - 4) + c0.bit_and((1).shl(bitpos - 4) - 1)
     for i in 0..NORD
         idx[i] = bkt[i] + nib
@@ -312,8 +314,8 @@ fn Model.adapt(mut self, e int, y int, limit int) int
 fn Model.predict(mut self) int
     st[0] = sq[o0[c0].shr(19)]
     for i in 0..NORD
-        # The mask makes a full-width int: AIL before 53fa67de stored a widened
-        # u32 into `cur` at four bytes (type.num.15). States are below 256.
+        # The mask makes a full-width int for `cur`: AIL before 53fa67de stored
+        # a widened sized value at its narrow width (type.num.15).
         s := t[idx[i]].to_int().bit_and(255)
         cur[i] = s
         p := sm[i * NSTATES + s].shr(19)
@@ -381,7 +383,7 @@ fn Model.update(mut self, y int)
         hs := cur[i]
         j := i * NSTATES + hs
         sm[j] = adapt(sm[j], y, LIMIT)
-        t[idx[i]] = nex[hs * 2 + y].to_u32()
+        t[idx[i]] = nex[hs * 2 + y].to_u8()
     if mctx >= 0
         em := adapt(msm[mctx], y, 1023)
         msm[mctx] = em
