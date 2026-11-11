@@ -82,7 +82,7 @@ so no earlier block is decoded.
 ## Error rules
 
 - `clove.usage`: a command line the tool can't act on; the message says what is missing.
-- `clove.format`: the archive is not CLV2, is truncated, or a block fails its CRC.
+- `clove.format`: the archive is not CLV4, is truncated, or a block fails its CRC.
 
 ## The fast engine (`fast/fast.ail`)
 

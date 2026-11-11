@@ -357,7 +357,7 @@ fn header_bytes(
     engines List[int],
 ) bytes
     mut h := List[int]()
-    h.extend([67, 76, 86, 51])
+    h.extend(to_ints(MAGIC))
     put(mut h, files.len(), 4)
     put(mut h, clens.len(), 4)
     put(mut h, bsize, 4)
