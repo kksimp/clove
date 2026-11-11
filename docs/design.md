@@ -69,3 +69,10 @@ See the decision cards in the Clove thread: engine tiering, block size, prior tr
 - zstd-style frame with an external dictionary file: the dictionary must travel
   separately; we embed the prior.
 - A separate index file: easily lost; the index lives in the archive.
+
+## rANS coders (opt v2 step V2a, 2026-11-09)
+
+`rans/rans.ail` holds the two entropy coders the planned opt v2 codec needs; no archive format uses them yet.
+- Static: normalised counts (total 2^12), FSE spread, one table lookup per symbol, two interleaved 32-bit states, byte-wise renormalisation.
+- Adaptive: 16-symbol (nibble) tables per context, one state. The probabilities keep a total of exactly 2^16 and move 1/32 toward each coded symbol. Rejected: counts with increment 32 halved when the total passes 2^12. Byte-wise rANS renormalises exactly only when the total divides the state range, so a halved count table (an arbitrary total) cannot be coded by it; a bit-wise or range-coder fallback would give up the speed rANS is chosen for.
+- Tests: round trips on random, skewed and single-symbol streams for both, and a speed test that prints MB/s on 8 MB of nibbles.

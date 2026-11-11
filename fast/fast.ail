@@ -1,13 +1,18 @@
 ## Clove's fast engine (codec 3): LZ77 with a hash chain and one-step lazy matching,
-## then canonical Huffman codes over byte-aligned little-endian bit packing, so a
-## block decodes with table lookups and byte copies, no arithmetic coding. It is
-## built for decode speed: one alphabet for literals, end of block and match lengths
-## (289 symbols) and one for distance slots (42), code lengths at most TBITS bits so
-## one 4096-entry table decodes any symbol in one lookup.
+## then a tANS (FSE-style) entropy coder, so a block decodes with one table lookup per
+## symbol and byte copies. It is built for decode speed: literals and match lengths share
+## one alphabet (289 symbols, 12-bit table), distance slots another (42 symbols, 10-bit
+## table), and the literal/length symbols alternate between two independent states so the
+## decoder runs two dependency chains. Extra bits live in a separate forward stream.
 ##
-## Block layout: 331 nibbles of code lengths (one per symbol, packed two per byte,
-## 166 bytes), then the bit stream. Lengths 4..273 and distances 1..2^20: both are
-## coded as a slot of two mantissa bits plus an exponent, and the low bits raw.
+## Block layout: VERSION byte; the normalised counts (per symbol a 4-bit bit length and
+## the bits under the leading one, literal/length alphabet then distances), padded to a
+## byte; u32 length M of the state stream; the state stream (M bytes: the three starting
+## states, then the state-transition bits in decode order, little-endian); the extra-bits
+## stream to the end of the block. The encoder walks the tokens backwards, so the decoder
+## reads both streams forwards and ends with all three states at 0.
+## Lengths 4..273 and distances 1..2^20: both are coded as a slot of two mantissa bits plus
+## an exponent, and the low bits raw.
 
 MINLEN := 4
 MAXLEN := 273
@@ -15,8 +20,11 @@ WINDOW := 1048576
 NLIT := 289
 NDIST := 42
 EOB := 256
-TBITS := 12
-TSIZE := 4096
+VERSION := 2
+LL := 12
+TL := 4096
+LD := 10
+TD := 1024
 HBITS := 16
 
 ## Length code for v = len - MINLEN: 0..7 direct, then 4 codes per power of two.
@@ -56,107 +64,126 @@ fn dist_base(code int) int
     e := (code - 4) / 2 + 2
     (2 + (code - 4) % 2).shl(e - 1) + 1
 
-## Code lengths (at most TBITS) for the frequencies, deterministic: pairs of the
-## smallest weights are joined, ties by lower index; when a code comes out longer
-## than TBITS the frequencies are halved (rounding up) and the tree rebuilt.
-fn code_lengths(freq List[int]) List[int]
-    n := freq.len()
-    mut f := [x for x in freq]
-    mut used := 0
-    for x in f
-        if x > 0
-            used += 1
-    mut lens := [0 for _ in 0..n]
-    if used == 0
-        return lens
-    if used == 1
-        for i in 0..n
-            if f[i] > 0
-                lens[i] = 1
-        return lens
-    while true
-        # nodes 0..n-1 are symbols, n.. are joins; parent[k] links up
-        mut w := [x for x in f]
-        mut parent := [-1 for _ in 0..2 * n]
-        mut alive := [x > 0 for x in f]
-        mut count := used
-        mut next := n
-        while count > 1
-            mut a := -1
-            mut b := -1
-            for i in 0..next
-                if alive[i]
-                    if a < 0 or w[i] < w[a]
-                        b = a
-                        a = i
-                    elif b < 0 or w[i] < w[b]
-                        b = i
-            alive[a] = false
-            alive[b] = false
-            w.push(w[a] + w[b])
-            alive.push(true)
-            parent[a] = next
-            parent[b] = next
-            next += 1
-            count -= 1
-        mut too_long := false
-        for i in 0..n
-            if f[i] > 0
-                mut d := 0
-                mut k := i
-                while parent[k] >= 0
-                    k = parent[k]
-                    d += 1
-                lens[i] = d
-                if d > TBITS
-                    too_long = true
-        if not too_long
-            return lens
-        for i in 0..n
-            if f[i] > 0
-                f[i] = (f[i] + 1) / 2
-    lens
+fn ilog2(x int) int
+    mut e := 0
+    while x.shr(e + 1) > 0
+        e += 1
+    e
 
-fn reverse(code int, len int) int
-    mut r := 0
-    mut c := code
-    for _ in 0..len
-        r = r.shl(1).bit_or(c.bit_and(1))
-        c = c.shr(1)
-    r
+fn bitlen(x int) int
+    if x == 0 then 0 else ilog2(x) + 1
 
-## Canonical codes from lengths, bit-reversed for the little-endian stream.
-fn codes_of(lens List[int]) List[int]
-    mut count := [0 for _ in 0..TBITS + 1]
-    for l in lens
-        count[l] += 1
-    count[0] = 0
-    mut next := [0 for _ in 0..TBITS + 2]
-    mut code := 0
-    for l in 1..TBITS + 1
-        code = (code + count[l - 1]).shl(1)
-        next[l] = code
-    mut out := [0 for _ in 0..lens.len()]
-    for i in 0..lens.len()
-        l := lens[i]
-        if l > 0
-            out[i] = reverse(next[l], l)
-            next[l] += 1
-    out
+## Counts summing to 2^l (each used symbol at least 1), proportional to the frequencies.
+fn norm(freq List[int], l int) List[int]
+    t := (1).shl(l)
+    mut total := 0
+    for f in freq
+        total += f
+    mut cnt := [0 for _ in 0..freq.len()]
+    if total == 0
+        return cnt
+    mut sum := 0
+    for i in 0..freq.len()
+        if freq[i] > 0
+            cnt[i] = (freq[i] * t / total).max(1)
+            sum += cnt[i]
+    mut diff := t - sum
+    while diff != 0
+        mut big := 0
+        for i in 0..cnt.len()
+            if cnt[i] > cnt[big]
+                big = i
+        if diff > 0
+            cnt[big] += diff
+            diff = 0
+        else
+            take := (0 - diff).min(cnt[big] - 1)
+            if take <= 0
+                break
+            cnt[big] -= take
+            diff += take
+    cnt
 
-## The decode table: entry = symbol * 16 + length at every index whose low bits are the code.
-fn table_of(lens List[int]) List[int]
-    codes := codes_of(lens)
-    mut t := [0 for _ in 0..TSIZE]
-    for i in 0..lens.len()
-        l := lens[i]
-        if l > 0
-            step := (1).shl(l)
-            mut k := codes[i]
-            while k < TSIZE
-                t[k] = i * 16 + l
-                k += step
-    t
+## Which symbol owns each of the 2^l table positions (FSE spread).
+fn spread(cnt List[int], l int) List[int]
+    t := (1).shl(l)
+    step := t.shr(1) + t.shr(3) + 3
+    mut tsym := [0 for _ in 0..t]
+    mut pos := 0
+    for s in 0..cnt.len()
+        for _ in 0..cnt[s]
+            tsym[pos] = s
+            pos = (pos + step).bit_and(t - 1)
+    tsym
+
+## Decode table, one entry per state: base + nbits * 4096 + symbol * 65536.
+fn dtable(cnt List[int], l int) List[int]
+    t := (1).shl(l)
+    tsym := spread(cnt, l)
+    mut nxt := [x for x in cnt]
+    mut tab := [0 for _ in 0..t]
+    for u in 0..t
+        s := tsym[u]
+        x := nxt[s]
+        nxt[s] += 1
+        nb := l - ilog2(x)
+        tab[u] = (x.shl(nb) - t) + nb.shl(12) + s.shl(16)
+    tab
+
+fn cumul(cnt List[int]) List[int]
+    mut cum := [0 for _ in 0..cnt.len()]
+    mut at := 0
+    for s in 0..cnt.len()
+        cum[s] = at
+        at += cnt[s]
+    cum
+
+## Encode table: for symbol s the states (count..2*count) map to T + the s-th table positions in order.
+fn etable(cnt List[int], cum List[int], l int) List[int]
+    t := (1).shl(l)
+    tsym := spread(cnt, l)
+    mut cur := [x for x in cum]
+    mut st := [0 for _ in 0..t]
+    for u in 0..t
+        s := tsym[u]
+        st[cur[s]] = t + u
+        cur[s] += 1
+    st
+
+## Bit shift an encoder state carries before the transition: l - floor(log2 count).
+fn shifts(cnt List[int], l int) List[int]
+    mut lg := [0 for _ in 0..cnt.len()]
+    for s in 0..cnt.len()
+        if cnt[s] > 0
+            lg[s] = l - ilog2(cnt[s])
+    lg
+
+## Encodes symbol s from state x: records the bits it emits, returns the new state.
+fn enc_step(
+    x int,
+    s int,
+    cnt List[int],
+    cum List[int],
+    lg List[int],
+    st List[int],
+    mut ev List[int],
+    mut ek List[int],
+) int
+    c := cnt[s]
+    nb0 := lg[s]
+    nb := if x.shr(nb0) < c then nb0 - 1 else nb0
+    ev.push(x.bit_and((1).shl(nb) - 1))
+    ek.push(nb)
+    st[cum[s] + x.shr(nb) - c]
+
+## k bits at bit position bp of src, zero past the end.
+fn rd(src List[u8], bp int, k int) int
+    mut v := 0
+    for i in 0..k
+        q := bp + i
+        b := if q / 8 < src.len() then src[q / 8].to_int().shr(q % 8).bit_and(1) else 0
+        v = v.bit_or(b.shl(i))
+    v
 
 struct Bits
     out List[u8]
@@ -258,120 +285,208 @@ pub fn compress(d List[u8], depth int) List[u8]
         for k in 1..ml
             insert(mut head, mut prev, d, pos + k, n)
         pos += ml
-    # frequencies, codes
+    # symbols and frequencies
     mut flit := [0 for _ in 0..NLIT]
     mut fdist := [0 for _ in 0..NDIST]
-    flit[EOB] = 1
+    mut syms := List[int]()
+    mut dsyms := List[int]()
     for i in 0..toks.len()
         t := toks[i]
         if t < 256
             flit[t] += 1
+            syms.push(t)
+            dsyms.push(-1)
         else
-            flit[257 + len_code(t - 256)] += 1
-            fdist[dist_code(dists[i])] += 1
-    llens := code_lengths(flit)
-    dlens := code_lengths(fdist)
-    lcodes := codes_of(llens)
-    dcodes := codes_of(dlens)
-    mut out := List[u8]()
-    for i in 0..(NLIT + NDIST + 1) / 2
-        a := if i * 2 < NLIT then llens[i * 2] else dlens[i * 2 - NLIT]
-        j := i * 2 + 1
-        b := if j < NLIT then llens[j] else if j < NLIT + NDIST then dlens[j - NLIT] else 0
-        out.push((a + b.shl(4)).to_u8())
-    mut w := Bits(out: out, acc: 0, n: 0)
+            ls := 257 + len_code(t - 256)
+            dc := dist_code(dists[i])
+            flit[ls] += 1
+            fdist[dc] += 1
+            syms.push(ls)
+            dsyms.push(dc)
+    lcnt := norm(flit, LL)
+    dcnt := norm(fdist, LD)
+    lcum := cumul(lcnt)
+    dcum := cumul(dcnt)
+    llg := shifts(lcnt, LL)
+    dlg := shifts(dcnt, LD)
+    lst := etable(lcnt, lcum, LL)
+    dst := etable(dcnt, dcum, LD)
+    # encode backwards: bits are recorded in encode order and written reversed
+    mut ev := List[int]()
+    mut ek := List[int]()
+    mut xa0 := TL
+    mut xa1 := TL
+    mut xd := TD
+    k := syms.len()
+    for j in 0..k
+        i := k - 1 - j
+        if dsyms[i] >= 0
+            xd = enc_step(xd, dsyms[i], dcnt, dcum, dlg, dst, mut ev, mut ek)
+        if i % 2 == 0
+            xa0 = enc_step(xa0, syms[i], lcnt, lcum, llg, lst, mut ev, mut ek)
+        else
+            xa1 = enc_step(xa1, syms[i], lcnt, lcum, llg, lst, mut ev, mut ek)
+    mut head_out := List[u8]()
+    head_out.push(VERSION.to_u8())
+    mut hw := Bits(out: head_out, acc: 0, n: 0)
+    for i in 0..NLIT + NDIST
+        c := if i < NLIT then lcnt[i] else dcnt[i - NLIT]
+        bl := bitlen(c)
+        hw.put(bl, 4)
+        if bl > 1
+            hw.put(c - (1).shl(bl - 1), bl - 1)
+    hw.finish()
+    mut mw := Bits(out: List[u8](), acc: 0, n: 0)
+    mw.put(xa0 - TL, LL)
+    mw.put(xa1 - TL, LL)
+    mw.put(xd - TD, LD)
+    m := ev.len()
+    for j in 0..m
+        i := m - 1 - j
+        mw.put(ev[i], ek[i])
+    mw.finish()
+    mut xw := Bits(out: List[u8](), acc: 0, n: 0)
     for i in 0..toks.len()
         t := toks[i]
-        if t < 256
-            w.put(lcodes[t], llens[t])
-        else
+        if t >= 256
             v := t - 256
             lc := len_code(v)
-            w.put(lcodes[257 + lc], llens[257 + lc])
-            w.put(v - len_base(lc), len_extra(lc))
-            dc := dist_code(dists[i])
-            w.put(dcodes[dc], dlens[dc])
-            w.put(dists[i] - dist_base(dc), dist_extra(dc))
-    w.put(lcodes[EOB], llens[EOB])
-    w.finish()
-    w.out
+            xw.put(v - len_base(lc), len_extra(lc))
+            dc := dsyms[i]
+            xw.put(dists[i] - dist_base(dc), dist_extra(dc))
+    xw.finish()
+    mut res := hw.out
+    mlen := mw.out.len()
+    res.push(mlen.bit_and(255).to_u8())
+    res.push(mlen.shr(8).bit_and(255).to_u8())
+    res.push(mlen.shr(16).bit_and(255).to_u8())
+    res.push(mlen.shr(24).bit_and(255).to_u8())
+    res.extend(mw.out)
+    res.extend(xw.out)
+    res
 
-## Decodes `n` bytes of a block made by `compress`; a damaged block gives an empty
-## list (the caller checks the length and the CRC).
+## Decodes `n` bytes of a block made by `compress`; a damaged block, or one from another
+## format version, gives an empty list (the caller checks the length and the CRC).
 pub fn decompress(src List[u8], n int) List[u8]
-    hdr := (NLIT + NDIST + 1) / 2
-    if src.len() < hdr + 1
+    if src.len() < 2 or src[0].to_int() != VERSION
         return []
-    mut llens := [0 for _ in 0..NLIT]
-    mut dlens := [0 for _ in 0..NDIST]
+    mut lcnt := [0 for _ in 0..NLIT]
+    mut dcnt := [0 for _ in 0..NDIST]
+    mut bp := 8
+    mut lsum := 0
+    mut dsum := 0
     for i in 0..NLIT + NDIST
-        v := src[i / 2].to_int()
-        l := if i % 2 == 0 then v.bit_and(15) else v.shr(4)
+        bl := rd(src, bp, 4)
+        bp += 4
+        mut c := 0
+        if bl > 0
+            c = (1).shl(bl - 1) + rd(src, bp, bl - 1)
+            bp += bl - 1
         if i < NLIT
-            llens[i] = l
+            lcnt[i] = c
+            lsum += c
         else
-            dlens[i - NLIT] = l
-    lt := table_of(llens)
-    dt := table_of(dlens)
+            dcnt[i - NLIT] = c
+            dsum += c
+    if bp > src.len() * 8
+        return []
+    if (lsum != TL and lsum != 0) or (dsum != TD and dsum != 0)
+        return []
+    if lsum == 0 and n > 0
+        return []
+    hp := (bp + 7) / 8
+    if hp + 4 > src.len()
+        return []
+    mlen := src[hp].to_int()
+        + src[hp + 1].to_int().shl(8)
+        + src[hp + 2].to_int().shl(16)
+        + src[hp + 3].to_int().shl(24)
+    mstart := hp + 4
+    mend := mstart + mlen
+    if mend > src.len()
+        return []
+    lt := if lsum > 0 then dtable(lcnt, LL) else [0]
+    dt := if dsum > 0 then dtable(dcnt, LD) else [0]
     mut out := [(0).to_u8() for _ in 0..n]
-    mut p := hdr
+    mut p := mstart
     mut acc := 0
     mut nb := 0
-    mut o := 0
+    while nb <= 48
+        if p < mend
+            acc = acc.bit_or(src[p].to_int().shl(nb))
+            p += 1
+        nb += 8
+    mut s0 := acc.bit_and(TL - 1)
+    acc = acc.shr(LL)
+    mut s1 := acc.bit_and(TL - 1)
+    acc = acc.shr(LL)
+    mut sd := acc.bit_and(TD - 1)
+    acc = acc.shr(LD)
+    nb -= 2 * LL + LD
+    mut p2 := mend
+    mut acc2 := 0
+    mut nb2 := 0
     end := src.len()
-    while true
-        # refill to more than 48 bits: a symbol, its extra bits, a slot and its extra bits
+    mut o := 0
+    mut side := 0
+    while o < n
+        # refill to more than 48 bits: a literal/length symbol and a distance symbol need 22
         while nb <= 48
-            if p < end
+            if p < mend
                 acc = acc.bit_or(src[p].to_int().shl(nb))
                 p += 1
             nb += 8
-        e := lt[acc.bit_and(TSIZE - 1)]
-        l := e.bit_and(15)
-        if l == 0
-            return []
-        acc = acc.shr(l)
-        nb -= l
-        sym := e.shr(4)
+        e := if side == 0 then lt[s0] else lt[s1]
+        bits := e.shr(12).bit_and(15)
+        ns := e.bit_and(4095) + acc.bit_and((1).shl(bits) - 1)
+        acc = acc.shr(bits)
+        nb -= bits
+        if side == 0
+            s0 = ns
+        else
+            s1 = ns
+        side = 1 - side
+        sym := e.shr(16)
         if sym < 256
-            if o >= n
-                return []
             out[o] = sym.to_u8()
             o += 1
             continue
-        if sym == EOB
-            break
+        if sym == EOB or dsum == 0
+            return []
         lc := sym - 257
         if lc >= 32
             return []
+        # extra bits: up to 6 for a length and 19 for a distance
+        while nb2 <= 32
+            if p2 < end
+                acc2 = acc2.bit_or(src[p2].to_int().shl(nb2))
+                p2 += 1
+            nb2 += 8
         k := len_extra(lc)
-        ml := MINLEN + len_base(lc) + acc.bit_and((1).shl(k) - 1)
-        acc = acc.shr(k)
-        nb -= k
-        de := dt[acc.bit_and(TSIZE - 1)]
-        dl := de.bit_and(15)
-        if dl == 0
-            return []
-        acc = acc.shr(dl)
-        nb -= dl
-        dc := de.shr(4)
+        ml2 := MINLEN + len_base(lc) + acc2.bit_and((1).shl(k) - 1)
+        acc2 = acc2.shr(k)
+        nb2 -= k
+        de := dt[sd]
+        dbits := de.shr(12).bit_and(15)
+        sd = de.bit_and(4095) + acc.bit_and((1).shl(dbits) - 1)
+        acc = acc.shr(dbits)
+        nb -= dbits
+        dc := de.shr(16)
         if dc >= NDIST
             return []
         dk := dist_extra(dc)
-        dist := dist_base(dc) + acc.bit_and((1).shl(dk) - 1)
-        acc = acc.shr(dk)
-        nb -= dk
-        if dist > o or o + ml > n
+        dist := dist_base(dc) + acc2.bit_and((1).shl(dk) - 1)
+        acc2 = acc2.shr(dk)
+        nb2 -= dk
+        if dist > o or o + ml2 > n
             return []
         at := o - dist
-        if dist >= ml
-            for i in 0..ml
-                out[o + i] = out[at + i]
-        else
-            for i in 0..ml
-                out[o + i] = out[at + i]
-        o += ml
-    if o != n then [] else out
+        for i in 0..ml2
+            out[o + i] = out[at + i]
+        o += ml2
+    if o != n or s0 != 0 or s1 != 0 or sd != 0
+        return []
+    out
 
 fn sample(n int, seed int) List[u8]
     mut xs := List[u8]()
@@ -408,6 +523,45 @@ fn sample(n int, seed int) List[u8]
     mut run := [(0).to_u8() for _ in 0..100000]
     assert(compress(run, 8).len() < 1000)
     assert_eq(decompress(compress(run, 8), run.len()), run)
+
+fn noise(n int, seed int) List[u8]
+    mut xs := List[u8]()
+    mut x := seed
+    for _ in 0..n
+        x = (x * 1103515245 + 12345).bit_and(2147483647)
+        xs.push(x.shr(16).bit_and(255).to_u8())
+    xs
+
+@test fn counts_are_normalised()
+    for l in [LD, LL]
+        f := [(i * i) % 17 + (if i % 5 == 0 then 400 else 0) for i in 0..100]
+        c := norm(f, l)
+        mut sum := 0
+        for i in 0..100
+            sum += c[i]
+            assert((c[i] > 0) == (f[i] > 0))
+        assert_eq(sum, (1).shl(l))
+    one := norm([0, 9, 0], LD)
+    assert_eq(one, [0, 1024, 0])
+
+@test fn roundtrips_random_and_large_text()
+    r := noise(70000, 9)
+    assert_eq(decompress(compress(r, 8), r.len()), r)
+    mut big := List[u8]()
+    mut i := 0
+    while big.len() < 4194304
+        big.extend("line {i}: the quick brown fox {i % 101} jumps over {i % 7} lazy dogs\n".to_bytes().to_list())
+        i += 1
+    c := compress(big, 8)
+    assert(c.len() * 4 < big.len())
+    assert_eq(decompress(c, big.len()), big)
+
+@test fn other_versions_are_refused()
+    d := sample(2000, 3)
+    mut c := compress(d, 8)
+    assert_eq(decompress(c, d.len()), d)
+    c[0] = (1).to_u8()
+    assert_eq(decompress(c, d.len()).len(), 0)
 
 @test fn one_symbol_alphabets_decode()
     d := [(65).to_u8() for _ in 0..3]
