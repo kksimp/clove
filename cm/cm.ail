@@ -156,7 +156,10 @@ fn build_states() States
 
 ## The starting probability of a state: (ones + 1/2) / (zeros + ones + 1), 21 bits, count 0.
 fn map_init(st States) List[int]
-    [((st.ones[s] * 2 + 1).shl(21) / (st.zeros[s] * 2 + st.ones[s] * 2 + 2)).shl(10) for s in 0..NSTATES]
+    [
+        ((st.ones[s] * 2 + 1).shl(21) / (st.zeros[s] * 2 + st.ones[s] * 2 + 2)).shl(10)
+        for s in 0..NSTATES
+    ]
 
 ## The SSE curve of context `cx`: 33 points over the logit range (0..65661, so u32).
 fn apm_init(nctx int) List[u32]
@@ -227,8 +230,14 @@ fn new_model(n int, exe int) Model
         sm: sm,
         cur: [0 for _ in 0..NORD],
         st: [0 for _ in 0..NIN],
-        wa: [if k % NIN < 1 + NORD or k % NIN >= 1 + 2 * NORD then 16000 else 4000 for k in 0..NIN * 256],
-        wb: [if k % NIN < 1 + NORD or k % NIN >= 1 + 2 * NORD then 16000 else 4000 for k in 0..NIN * 1024],
+        wa: [
+            if k % NIN < 1 + NORD or k % NIN >= 1 + 2 * NORD then 16000 else 4000
+            for k in 0..NIN * 256
+        ],
+        wb: [
+            if k % NIN < 1 + NORD or k % NIN >= 1 + 2 * NORD then 16000 else 4000
+            for k in 0..NIN * 1024
+        ],
         wf: [32768 for _ in 0..16],
         dotf: 0,
         msm: [INIT for _ in 0..64],
@@ -303,7 +312,9 @@ fn Model.adapt(mut self, e int, y int, limit int) int
 fn Model.predict(mut self) int
     st[0] = sq[o0[c0].shr(19)]
     for i in 0..NORD
-        s := t[idx[i]].to_int()
+        # The mask makes a full-width int: AIL before 53fa67de stored a widened
+        # u32 into `cur` at four bytes (type.num.15). States are below 256.
+        s := t[idx[i]].to_int().bit_and(255)
         cur[i] = s
         p := sm[i * NSTATES + s].shr(19)
         st[i + 1] = sq[p]
