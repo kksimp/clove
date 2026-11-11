@@ -1,0 +1,404 @@
+## Clove's rANS coders (opt v2, step V2a; no format uses them yet).
+##
+## Both coders are 32-bit rANS with byte-wise renormalisation: the state lives in
+## [RLOW, RLOW * 256) = [2^23, 2^31), so a state always fits four bytes and every
+## product stays far inside `int`. Encoding runs backwards over the symbols and
+## writes bytes backwards; the finished stream is reversed so the decoder reads it
+## forwards. Integer-only, so every machine produces the same bytes.
+##
+## Static coder: normalised counts (total 2^12) are spread over the 4096 slots with
+## the FSE step, and a symbol's r-th slot stands for the residue r, so the decode
+## table is one lookup per symbol (symbol, and the rank that restores the state).
+## Two states alternate (symbol i uses state i mod 2) so the decoder has two
+## independent dependency chains. Symbols are bytes, at most 256 of them.
+##
+## Adaptive coder: 16-symbol (nibble) tables per context, one state (the decoder must
+## update a table before the next symbol). The probabilities always sum to exactly
+## 2^16: after a symbol every entry loses its 1/32 and the symbol takes what was
+## shed. rANS renormalises exactly only when the total divides the state range, so a
+## count table that is halved at an arbitrary total (rescale at 2^12) cannot be
+## coded by byte-wise rANS; this shift update adapts at the same speed and keeps the
+## total a power of two. The stall below 32/65536 costs under 0.02 bit a symbol.
+
+RLOW := 8388608
+TM := 4096
+STEP := 2563
+XMAX12 := 524288
+NM := 65536
+XMAX16 := 32768
+
+fn put_u32(mut out List[u8], v int)
+    for k in 0..4
+        out.push(v.shr(8 * k).bit_and(255).to_u8())
+
+## Four bytes little-endian at `p`; bytes past the end read as 0.
+fn rd32(d List[u8], p int) int
+    mut v := 0
+    for k in 0..4
+        if p + k < d.len()
+            v += d[p + k].to_int().shl(8 * k)
+    v
+
+## A state, most significant byte first: after the final reversal it is little-endian.
+fn push_state(mut out List[u8], v int)
+    out.push(v.shr(24).bit_and(255).to_u8())
+    out.push(v.shr(16).bit_and(255).to_u8())
+    out.push(v.shr(8).bit_and(255).to_u8())
+    out.push(v.bit_and(255).to_u8())
+
+## Counts scaled to total 4096, every symbol that occurs keeps at least 1. The
+## rounding error goes to the most frequent symbols. No symbols at all gives symbol 0.
+pub fn normalize(counts List[int]) List[int]
+    requires counts.len() >= 1 and counts.len() <= 256
+    mut total := 0
+    for c in counts
+        total += c
+    mut f := [0 for _ in 0..counts.len()]
+    if total == 0
+        f[0] = TM
+        return f
+    mut sum := 0
+    for i in 0..counts.len()
+        if counts[i] > 0
+            v := counts[i] * TM / total
+            f[i] = if v < 1 then 1 else v
+            sum += f[i]
+    while sum != TM
+        mut top := 0
+        for k in 1..f.len()
+            if f[k] > f[top]
+                top = k
+        if sum < TM
+            f[top] += TM - sum
+            sum = TM
+        else
+            take := (sum - TM).min(f[top] - 1)
+            f[top] -= take
+            sum -= take
+    f
+
+## Decode and encode tables of one static model.
+pub struct Table
+    fq List[int]
+    st List[int]
+    sl List[int]
+    sy List[u8]
+    rk List[int]
+
+## `fq` frequencies per symbol, `st` where each symbol's slots start in `sl`, `sl` the
+## slot of each symbol's r-th occurrence, `sy` the symbol of each slot, `rk` the rank
+## of each slot inside its symbol. `f` must sum to 4096.
+pub fn build_table(f List[int]) Table
+    n := f.len()
+    mut starts := [0 for _ in 0..n]
+    mut acc := 0
+    for s in 0..n
+        starts[s] = acc
+        acc += f[s]
+    assert_eq(acc, TM)
+    mut syms := [(0).to_u8() for _ in 0..TM]
+    mut spot := 0
+    for s in 0..n
+        for _ in 0..f[s]
+            syms[spot] = s.to_u8()
+            spot = (spot + STEP).bit_and(TM - 1)
+    mut slots := [0 for _ in 0..TM]
+    mut ranks := [0 for _ in 0..TM]
+    mut seen := [0 for _ in 0..n]
+    for slot in 0..TM
+        s := syms[slot].to_int()
+        r := seen[s]
+        slots[starts[s] + r] = slot
+        ranks[slot] = r
+        seen[s] = r + 1
+    Table(fq: f, st: starts, sl: slots, sy: syms, rk: ranks)
+
+## The two-state stream of `syms` under `t`: eight bytes of states, then the renormalisation bytes.
+## Every symbol must have a nonzero frequency in `t`.
+pub fn enc_stream(t Table, syms List[u8]) List[u8]
+    mut out := List[u8]()
+    mut x0 := RLOW
+    mut x1 := RLOW
+    mut i := syms.len() - 1
+    while i >= 0
+        s := syms[i].to_int()
+        f := t.fq[s]
+        xmax := f * XMAX12
+        mut x := if i.bit_and(1) == 0 then x0 else x1
+        while x >= xmax
+            out.push(x.bit_and(255).to_u8())
+            x = x.shr(8)
+        x = (x / f) * TM + t.sl[t.st[s] + x % f]
+        if i.bit_and(1) == 0
+            x0 = x
+        else
+            x1 = x
+        i -= 1
+    push_state(mut out, x1)
+    push_state(mut out, x0)
+    out.reverse()
+    out
+
+## `n` symbols from the stream that starts at `start` in `data`. Bytes past the end read as 0.
+pub fn dec_stream(t Table, data List[u8], start int, n int) List[u8]
+    mut out := [(0).to_u8() for _ in 0..n]
+    dn := data.len()
+    mut pos := start + 8
+    mut x0 := rd32(data, start)
+    mut x1 := rd32(data, start + 4)
+    mut i := 0
+    while i < n
+        slot0 := x0.bit_and(4095)
+        s0 := t.sy[slot0]
+        out[i] = s0
+        x0 = t.fq[s0.to_int()] * x0.shr(12) + t.rk[slot0]
+        while x0 < RLOW
+            nb0 := if pos < dn then data[pos].to_int() else 0
+            x0 = x0.shl(8).bit_or(nb0)
+            pos += 1
+        if i + 1 < n
+            slot1 := x1.bit_and(4095)
+            s1 := t.sy[slot1]
+            out[i + 1] = s1
+            x1 = t.fq[s1.to_int()] * x1.shr(12) + t.rk[slot1]
+            while x1 < RLOW
+                nb1 := if pos < dn then data[pos].to_int() else 0
+                x1 = x1.shl(8).bit_or(nb1)
+                pos += 1
+        i += 2
+    out
+
+## A self-contained static stream of symbols below `nsym`: nsym - 1, one varint
+## frequency per symbol, the symbol count (4 bytes), then `enc_stream`.
+pub fn encode(syms List[u8], nsym int) List[u8]
+    requires nsym >= 1 and nsym <= 256
+    mut counts := [0 for _ in 0..nsym]
+    for s in syms
+        counts[s.to_int()] += 1
+    f := normalize(counts)
+    mut out := List[u8]()
+    out.push((nsym - 1).to_u8())
+    for v in f
+        if v < 128
+            out.push(v.to_u8())
+        else
+            out.push(v.bit_and(127).bit_or(128).to_u8())
+            out.push(v.shr(7).to_u8())
+    put_u32(mut out, syms.len())
+    out.extend(enc_stream(build_table(f), syms))
+    out
+
+pub fn decode(data List[u8]) List[u8]
+    nsym := data[0].to_int() + 1
+    mut pos := 1
+    mut f := List[int]()
+    for _ in 0..nsym
+        b := data[pos].to_int()
+        pos += 1
+        mut v := b.bit_and(127)
+        if b >= 128
+            v += data[pos].to_int().shl(7)
+            pos += 1
+        f.push(v)
+    n := rd32(data, pos)
+    dec_stream(build_table(f), data, pos + 4, n)
+
+## Adaptive nibble model (`p`, 16 probabilities per context, total 2^16) and, for the
+## decoder, the stream (`src`, `pos`) and the state `x`.
+pub struct Nib
+    p List[int]
+    src List[u8]
+    pos int
+    x int
+
+## A model with `nctx` contexts and no stream (the encoder's side).
+pub fn Nib.new(nctx int) Nib
+    n := nctx * 16
+    Nib(p: [4096 for _ in 0..n], src: [], pos: 0, x: RLOW)
+
+## A decoder over the stream at `start` in `data`.
+pub fn Nib.open(data List[u8], start int, nctx int) Nib
+    n := nctx * 16
+    Nib(p: [4096 for _ in 0..n], src: data, pos: start + 4, x: rd32(data, start))
+
+## The probability mass below symbol `s` in context `ctx`.
+pub fn Nib.cum(self, ctx int, s int) int
+    mut c := 0
+    for j in 0..s
+        c += p[ctx * 16 + j]
+    c
+
+## Move context `ctx` toward symbol `s`; the total stays 65536.
+pub fn Nib.update(mut self, ctx int, s int)
+    base := ctx * 16
+    mut tot := 0
+    for j in 0..16
+        v := p[base + j] - p[base + j].shr(5)
+        p[base + j] = v
+        tot += v
+    p[base + s] += NM - tot
+
+## Decode one nibble in context `ctx`, then adapt.
+pub fn Nib.next(mut self, ctx int) int
+    r := x.bit_and(65535)
+    base := ctx * 16
+    mut s := 0
+    mut c := 0
+    while r >= c + p[base + s]
+        c += p[base + s]
+        s += 1
+    x = p[base + s] * x.shr(16) + r - c
+    while x < RLOW
+        nb := if pos < src.len() then src[pos].to_int() else 0
+        x = x.shl(8).bit_or(nb)
+        pos += 1
+    update(ctx, s)
+    s
+
+## The adaptive stream of `syms` (values below 16) where symbol i is coded in context
+## `ctxs[i]` (below `nctx`; `ctxs` is unread when `nctx` is 1): four bytes of final state,
+## then the renormalisation bytes. The decoder must be able to rebuild each context
+## from what it has already decoded.
+pub fn nib_enc(syms List[u8], ctxs List[u8], nctx int) List[u8]
+    n := syms.len()
+    mut m := Nib.new(nctx)
+    mut cf := [(0).to_u32() for _ in 0..n]
+    for i in 0..n
+        c := if nctx > 1 then ctxs[i].to_int() else 0
+        s := syms[i].to_int()
+        cf[i] = (m.cum(c, s).shl(16) + m.p[c * 16 + s]).to_u32()
+        m.update(c, s)
+    mut out := List[u8]()
+    mut x := RLOW
+    mut k := n - 1
+    while k >= 0
+        v := cf[k].to_int()
+        f := v.bit_and(65535)
+        cc := v.shr(16)
+        while x >= f * XMAX16
+            out.push(x.bit_and(255).to_u8())
+            x = x.shr(8)
+        x = (x / f) * NM + cc + x % f
+        k -= 1
+    push_state(mut out, x)
+    out.reverse()
+    out
+
+## A self-contained adaptive stream: the symbol count (4 bytes), then `nib_enc` with
+## no context, or with the previous symbol as the context (`order1`).
+pub fn nib_encode(syms List[u8], order1 bool) List[u8]
+    mut ctxs := List[u8]()
+    mut prev := 0
+    if order1
+        for s in syms
+            ctxs.push(prev.to_u8())
+            prev = s.to_int()
+    mut out := List[u8]()
+    put_u32(mut out, syms.len())
+    out.extend(nib_enc(syms, ctxs, if order1 then 16 else 1))
+    out
+
+pub fn nib_decode(data List[u8], order1 bool) List[u8]
+    n := rd32(data, 0)
+    nctx := if order1 then 16 else 1
+    mut d := Nib.open(data, 4, nctx)
+    mut out := [(0).to_u8() for _ in 0..n]
+    mut prev := 0
+    for i in 0..n
+        ctx := if order1 then prev else 0
+        s := d.next(ctx)
+        out[i] = s.to_u8()
+        prev = s
+    out
+
+## n symbols below `nsym` from a 31-bit LCG: `kind` 0 uniform, 1 skewed to the low symbols.
+fn gen(n int, nsym int, kind int) List[u8]
+    mut d := List[u8]()
+    mut seed := 12345
+    for _ in 0..n
+        seed = (seed * 1103515245 + 12345) % 2147483648
+        v := seed.shr(8).bit_and(65535)
+        s := if kind == 0 then v % nsym else (v % nsym) * (v / 256 % nsym) / nsym
+        d.push(s.to_u8())
+    d
+
+@test fn normalize_sums_to_the_table_and_keeps_every_symbol()
+    for counts in [[1, 1000000, 3, 0, 7], [5], [0, 0, 9], [1, 1, 1, 1], [100, 1, 1, 1, 1, 1, 1]]
+        f := normalize(counts)
+        assert_eq(f.sum(), 4096)
+        for i in 0..counts.len()
+            assert_eq(f[i] > 0, counts[i] > 0)
+    many := normalize([1 for _ in 0..256])
+    assert_eq(many.sum(), 4096)
+    assert_eq(normalize([0, 0]), [4096, 0])
+
+@test fn static_tables_are_a_bijection_on_slots()
+    t := build_table(normalize([30, 1, 500, 0, 7]))
+    mut hit := [0 for _ in 0..4096]
+    for s in 0..5
+        for r in 0..t.fq[s]
+            slot := t.sl[t.st[s] + r]
+            hit[slot] += 1
+            assert_eq(t.sy[slot].to_int(), s)
+            assert_eq(t.rk[slot], r)
+    assert_eq(hit, [1 for _ in 0..4096])
+
+@test fn static_coder_round_trips_random_skewed_and_single_symbol_streams()
+    for n in [0, 1, 2, 3, 4, 5, 1000, 4097]
+        assert_eq(decode(encode(gen(n, 256, 0), 256)), gen(n, 256, 0))
+        assert_eq(decode(encode(gen(n, 16, 1), 16)), gen(n, 16, 1))
+        one := [(5).to_u8() for _ in 0..n]
+        assert_eq(decode(encode(one, 16)), one)
+    assert_eq(decode(encode([(0).to_u8() for _ in 0..77], 1)), [(0).to_u8() for _ in 0..77])
+
+@test fn static_coder_compresses_skewed_streams()
+    d := gen(20000, 16, 1)
+    assert(encode(d, 16).len() < 20000 * 6 / 10)
+
+@test fn adaptive_coder_round_trips_random_skewed_and_single_symbol_streams()
+    for order1 in [false, true]
+        for n in [0, 1, 2, 3, 5, 1000, 4097]
+            u := gen(n, 16, 0)
+            assert_eq(nib_decode(nib_encode(u, order1), order1), u)
+            k := gen(n, 16, 1)
+            assert_eq(nib_decode(nib_encode(k, order1), order1), k)
+            one := [(9).to_u8() for _ in 0..n]
+            assert_eq(nib_decode(nib_encode(one, order1), order1), one)
+
+@test fn adaptive_coder_learns_the_stream()
+    one := [(3).to_u8() for _ in 0..20000]
+    assert(nib_encode(one, false).len() < 400)
+    mut cycle := List[u8]()
+    for i in 0..20000
+        cycle.push((i % 7).to_u8())
+    assert(nib_encode(cycle, true).len() < 500)
+    assert(nib_encode(cycle, false).len() > 5000)
+    assert_eq(nib_decode(nib_encode(cycle, true), true), cycle)
+
+@test fn adaptive_probabilities_keep_the_total()
+    mut m := Nib.new(2)
+    for i in 0..5000
+        m.update(i % 2, (i * i / 3) % 16)
+    assert_eq(m.cum(0, 15) + m.p[15], 65536)
+    assert_eq(m.cum(1, 15) + m.p[31], 65536)
+    for v in m.p
+        assert(v > 0)
+
+## Prints the speed of both coders on 8 MB of nibbles; asserts only the round trip.
+@test fn speed_of_both_coders_is_printed()
+    n := 8388608
+    d := gen(n, 16, 1)
+    t0 := time.now_ms()
+    e := encode(d, 16)
+    t1 := time.now_ms()
+    back := decode(e)
+    t2 := time.now_ms()
+    assert_eq(back, d)
+    print("static tANS-spread rANS, {n} nibbles -> {e.len()} B: encode {n / ((t1 - t0).max(1) * 1000)} MB/s, decode {n / ((t2 - t1).max(1) * 1000)} MB/s")
+    t3 := time.now_ms()
+    a := nib_encode(d, true)
+    t4 := time.now_ms()
+    back2 := nib_decode(a, true)
+    t5 := time.now_ms()
+    assert_eq(back2, d)
+    print("adaptive nibble rANS (order 1), {n} nibbles -> {a.len()} B: encode {n / ((t4 - t3).max(1) * 1000)} MB/s, decode {n / ((t5 - t4).max(1) * 1000)} MB/s")
