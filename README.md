@@ -86,10 +86,11 @@ so no earlier block is decoded.
 
 ## The fast engine (`fast/fast.ail`)
 
-LZ77 (hash chain, one-step lazy matching, 1 MB window) and canonical Huffman codes over a
-little-endian bit stream: one alphabet of 289 symbols for literals, end of block and match
-lengths, one of 42 for distance slots, code lengths at most 12 bits so a 4096-entry table
-decodes any symbol in one lookup. The block starts with the 331 code lengths as nibbles.
+LZ77 (hash chain, one-step lazy matching, 1 MB window) and a tANS (FSE-style) entropy coder:
+one alphabet of 289 symbols for literals and match lengths (12-bit table, two interleaved
+states) and one of 42 for distance slots (10-bit table), so the decoder does one table lookup
+per symbol on independent dependency chains. Extra bits are a separate forward stream. The block
+starts with a version byte and the normalised counts; an older block is refused.
 It is the default engine (`-m fast`); `-m lz` is the range-coded LZ with a greedy parse.
 
 ## The codec (`cm/cm.ail`; the code is the spec)

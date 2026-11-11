@@ -40,7 +40,7 @@ BLOCK_ENT := 17
 USAGE := """
     usage: clove COMMAND ...
       a [-m fast|opt|max | -1..-9] [-b BLOCK_KB] [-x PATTERN]... ARCHIVE PATH...
-                                        add (fast: LZ + Huffman, 1 MB blocks; opt: LZ parsed
+                                        add (fast: LZ + tANS, 1 MB blocks; opt: LZ parsed
                                         optimally, range coded; max: context mixing, 4 MB blocks)
                                         -1..-3 is fast, -4..-7 opt, -8..-9 max; -x skips names
                                         matching a shell pattern (*, ?), such as -x '*.o' -x .git
