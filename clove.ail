@@ -542,7 +542,13 @@ fn Writer.add(mut self, piece bytes, kind int) int ! fs.IoError
         flush(false)?
     nl
 
-fn cmd_add(archive str, paths List[str], bsize int, engine int, skip List[str]) ! CloveError | fs.IoError
+fn cmd_add(
+    archive str,
+    paths List[str],
+    bsize int,
+    engine int,
+    skip List[str],
+) ! CloveError | fs.IoError
     items := collect(paths, skip)?
     tmp := "{archive}.tmp"
     fs.write_bytes(tmp, b"")?
@@ -1196,7 +1202,10 @@ fn parse(args List[str]) Opts ! CloveError
             if ends[1] != ""
                 o.hi = ends[1].to_int() else return Usage(text: "--range needs numbers")
             i += 2
-        elif a.len() == 2 and a.starts_with("-") and a.chars()[1].code() >= 49 and a.chars()[1].code() <= 57
+        elif a.len() == 2
+            and a.starts_with("-")
+            and a.chars()[1].code() >= 49
+            and a.chars()[1].code() <= 57
             lvl := a.chars()[1].code() - 48
             o.engine = if lvl <= 3 then 4 else if lvl <= 7 then 3 else 1
             i += 1
