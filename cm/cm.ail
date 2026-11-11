@@ -5,7 +5,7 @@
 ##
 ## Per bit, eight hashed context models (orders 1-4 and 6, the current word,
 ## the word pair, and a sparse context that skips a byte; in machine code the two
-## word contexts become instruction contexts, see Model.end_byte), a direct order-0
+## word contexts become instruction contexts, see end_byte), a direct order-0
 ## model and the match model each give a probability. A hashed slot holds a bit
 ## history (a state of the machine in `states`: how many zeros and ones were seen
 ## and which came last), and an adaptive map per order turns the state into a
@@ -89,7 +89,7 @@ fn delta_table() List[int]
     [131072 / (2 * n + 3) for n in 0..1024]
 
 ## Table slots hold a 21-bit probability over a 10-bit hit count in a u32; the count
-## sets the learning rate (fast at first, then settling at 1/limit). See Model.adapt.
+## sets the learning rate (fast at first, then settling at 1/limit). See adapt.
 
 fn fold(x int) int
     x.bit_xor(x.shr(32)).bit_and(268435455)
@@ -168,267 +168,270 @@ fn apm_init(nctx int) List[u32]
     curve := [(squash((j - 16) * 128) * 16).to_u32() for j in 0..33]
     [curve[k % 33] for k in 0..nctx * 33]
 
-struct Model
-    t List[u8]
-    tbits int
-    o0 List[int]
-    idx List[int]
-    bkt List[int]
-    hv List[int]
-    chk List[int]
-    nex List[int]
-    sm List[int]
-    cur List[int]
-    st List[int]
-    wa List[int]
-    wb List[int]
-    wf List[int]
-    dotf int
-    msm List[int]
-    mtab List[u32]
-    mbits int
-    a1 List[u32]
-    a2 List[u32]
-    buf List[u8]
-    sq List[int]
-    dt List[int]
-    c0 int
-    c4 int
-    c8 int
-    word0 int
-    word1 int
-    bitpos int
-    mptr int
-    mlen int
-    mctx int
-    sela int
-    selb int
-    dota int
-    dotb int
-    pmix int
-    i1 int
-    i2 int
-    pr int
-    exe int
+## The model's state. One `int` list `m` holds every scalar and every small
+## table at a fixed offset, and the hot code is free functions over list
+## parameters, not methods over struct fields: the compiler keeps a parameter
+## list's header in registers across a loop (native.bce.11) and forwards it
+## along straight-line code, which it can't do for a field. The offsets:
+##
+##     0 c0   1 c4   2 c8   3 word0   4 word1   5 bitpos   6 mptr   7 mlen
+##     8 mctx   9 sela   10 selb   11 dota   12 dotb   13 dotf   14 pmix
+##     17 nib   18 tbits   19 mbits   20 exe
+##     BKT 32 (8 bucket starts)   HV 40 (8 context hashes)   CUR 48 (8 states)
+##     ST 56 (19 mixer inputs)   WF 80 (16 final weights)   MSM 96 (64)
+##     O0 160 (256)   NEX 416 (350)   SM 768 (8 x 175 maps)   DT 2176 (1024)
+##     STR 3200 (4096 stretch)   WA 7296 (19 x 256)   WB 12160 (19 x 1024)
+##
+## Beside it: `t` the history slots, `a1`/`a2` the SSE curves, `mtab` the match
+## table and `buf` the bytes so far.
+BKT := 32
+HV := 40
+CUR := 48
+ST := 56
+WF := 80
+MSM := 96
+O0 := 160
+NEX := 416
+SM := 768
+DT := 2176
+STR := 3200
+WA := 7296
+WB := 12160
+MSIZE := 31616
 
-## A model for an `n`-byte block; `exe` is the block's executable filter (0 for data).
-fn new_model(n int, exe int) Model
-    tbits := bits_for(n * 2, 12, TCAP)
-    mbits := bits_for(n, 10, 20)
+fn start_weight(k int) int
+    if k % NIN < 1 + NORD or k % NIN >= 1 + 2 * NORD then 16000 else 4000
+
+## The state for an `n`-byte block; `exe` is the block's executable filter (0 for data).
+fn new_m(n int, exe int) List[int]
     states := build_states()
     one_map := map_init(states)
-    mut sm := List[int]()
-    for _ in 0..NORD
-        sm.extend(one_map)
-    mut m := Model(
-        t: [(0).to_u8() for _ in 0..NORD * (1).shl(tbits)],
-        tbits: tbits,
-        o0: [INIT for _ in 0..256],
-        idx: [0 for _ in 0..NORD],
-        bkt: [0 for _ in 0..NORD],
-        hv: [0 for _ in 0..NORD],
-        chk: [0 for _ in 0..NORD],
-        nex: states.nex,
-        sm: sm,
-        cur: [0 for _ in 0..NORD],
-        st: [0 for _ in 0..NIN],
-        wa: [
-            if k % NIN < 1 + NORD or k % NIN >= 1 + 2 * NORD then 16000 else 4000
-            for k in 0..NIN * 256
-        ],
-        wb: [
-            if k % NIN < 1 + NORD or k % NIN >= 1 + 2 * NORD then 16000 else 4000
-            for k in 0..NIN * 1024
-        ],
-        wf: [32768 for _ in 0..16],
-        dotf: 0,
-        msm: [INIT for _ in 0..64],
-        mtab: [(0).to_u32() for _ in 0..(1).shl(mbits)],
-        mbits: mbits,
-        a1: apm_init(256),
-        a2: apm_init(65536),
-        buf: [],
-        sq: stretch_table(),
-        dt: delta_table(),
-        c0: 1,
-        c4: 0,
-        c8: 0,
-        word0: 0,
-        word1: 0,
-        bitpos: 0,
-        mptr: 0,
-        mlen: 0,
-        mctx: 0,
-        sela: 0,
-        selb: 0,
-        dota: 0,
-        dotb: 0,
-        pmix: 2048,
-        i1: 0,
-        i2: 0,
-        pr: 2048,
-        exe: exe,
-    )
-    m.set_idx()
+    sq := stretch_table()
+    dt := delta_table()
+    mut m := [0 for _ in 0..MSIZE]
+    m[0] = 1
+    m[14] = 2048
+    m[18] = bits_for(n * 2, 12, TCAP)
+    m[19] = bits_for(n, 10, 20)
+    m[20] = exe
+    for i in 0..16
+        m[WF + i] = 32768
+    for i in 0..64
+        m[MSM + i] = INIT
+    for i in 0..256
+        m[O0 + i] = INIT
+    for i in 0..NSTATES * 2
+        m[NEX + i] = states.nex[i]
+    for i in 0..NORD * NSTATES
+        m[SM + i] = one_map[i % NSTATES]
+    for i in 0..1024
+        m[DT + i] = dt[i]
+    for i in 0..4096
+        m[STR + i] = sq[i]
+    for i in 0..NIN * 256
+        m[WA + i] = start_weight(i)
+    for i in 0..NIN * 1024
+        m[WB + i] = start_weight(i)
     m
 
-## Slots of the context models for the next bit. Each context hashes once per
-## nibble to a bucket of 16 one-byte slots (four buckets to a cache line); the bits of the
-## nibble so far pick slots 1..15, so a byte costs two cache misses per context
-## instead of eight. Slot 0 holds a check byte from other bits of the hash: a
-## bucket that belongs to a different context is cleared before use.
-fn Model.set_idx(mut self)
+## Bucket starts of the context models for the next nibble, and the slot within
+## a bucket for the next bit. Each context hashes once per nibble to a bucket of
+## 16 one-byte slots (four buckets to a cache line); the bits of the nibble so
+## far pick slots 1..15, so a byte costs two cache misses per context instead
+## of eight. Slot 0 holds a check byte from other bits of the hash: a bucket
+## that belongs to a different context is cleared before use.
+fn set_idx(mut m List[int], mut t List[u8])
+    c0 := m[0]
+    bitpos := m[5]
     if bitpos == 0 or bitpos == 4
+        tbits := m[18]
         bmask := (1).shl(tbits - 4) - 1
         for i in 0..NORD
-            h := (hv[i] + c0 * 40503) * 2654435761
-            bkt[i] = h.shr(20).bit_and(bmask).shl(4) + i.shl(tbits)
+            h := (m[HV + i] + c0 * 40503) * 2654435761
+            b := h.shr(20).bit_and(bmask).shl(4) + i.shl(tbits)
+            m[BKT + i] = b
             check := h.shr(44).bit_and(255)
-            if t[bkt[i]].to_int() != check
-                t[bkt[i]] = check.to_u8()
+            if t[b].to_int() != check
+                t[b] = check.to_u8()
                 for k in 1..16
-                    t[bkt[i] + k] = (0).to_u8()
-    nib := if bitpos < 4 then c0 else (1).shl(bitpos - 4) + c0.bit_and((1).shl(bitpos - 4) - 1)
-    for i in 0..NORD
-        idx[i] = bkt[i] + nib
+                    t[b + k] = (0).to_u8()
+    m[17] = if bitpos < 4 then c0 else (1).shl(bitpos - 4) + c0.bit_and((1).shl(bitpos - 4) - 1)
 
-## SSE: interpolate the curve of context `cx` (stage 1 or 2) at p's logit.
-fn Model.apm(mut self, stage int, cx int, p int) int
-    s := sq[p] + 2048
-    j := cx * 33 + s.shr(7)
-    w := s.bit_and(127)
-    if stage == 1
-        return (a1[j].to_int() * (128 - w) + a1[j + 1].to_int() * w).shr(11)
-    (a2[j].to_int() * (128 - w) + a2[j + 1].to_int() * w).shr(11)
-
-fn Model.adapt(mut self, e int, y int, limit int) int
+## A slot of a map: a 21-bit probability over a 10-bit hit count. `rate` is the
+## step for that count (`DT`): fast at first, then settling at 1/limit.
+fn adapt(e int, y int, limit int, rate int) int
     n := e.bit_and(1023)
     p := e.shr(10)
-    p2 := p + ((y.shl(21) - p) * dt[n]) / 65536
+    p2 := p + ((y.shl(21) - p) * rate) / 65536
     n2 := if n < limit then n + 1 else n
     p2.shl(10) + n2
 
 ## The probability (12 bits) that the next bit is 1. Inputs: 0 the order-0 model,
 ## 1..8 the histories' logits, 9 the match model, 10 a bias, 11..18 the histories'
 ## linear leans (0 for a context never seen).
-fn Model.predict(mut self) int
-    st[0] = sq[o0[c0].shr(19)]
+fn predict(mut m List[int], t List[u8], a1 List[u32], a2 List[u32], buf List[u8]) int
+    c0 := m[0]
+    c4 := m[1]
+    bitpos := m[5]
+    mlen := m[7]
+    nib := m[17]
+    m[ST] = m[STR + m[O0 + c0].shr(19)]
     for i in 0..NORD
-        # The mask makes a full-width int for `cur`: AIL before 53fa67de stored
+        # The mask makes a full-width int to store: AIL before 53fa67de stored
         # a widened sized value at its narrow width (type.num.15).
-        s := t[idx[i]].to_int().bit_and(255)
-        cur[i] = s
-        p := sm[i * NSTATES + s].shr(19)
-        st[i + 1] = sq[p]
-        st[11 + i] = if s == 0 then 0 else (p - 2048) / 4
-    mut active := 0
-    st[9] = 0
-    mctx = -1
-    if mlen > 0
-        e := buf[mptr].to_int()
-        if (e + 256).shr(8 - bitpos) == c0
-            active = 1
-            eb := e.shr(7 - bitpos).bit_and(1)
-            lb := if mlen < 16 then mlen else 16 + ((mlen - 16) / 8).min(15)
-            mctx = lb * 2 + eb
-            st[9] = sq[msm[mctx].shr(19)]
-    st[10] = 256
+        s := t[m[BKT + i] + nib].to_int().bit_and(255)
+        m[CUR + i] = s
+        p := m[SM + i * NSTATES + s].shr(19)
+        m[ST + 1 + i] = m[STR + p]
+        m[ST + 11 + i] = if s == 0 then 0 else (p - 2048) / 4
     mut mb := 0
-    if active == 1
-        mb = 3
-        if mlen < 16
-            mb = 1
-        elif mlen < 32
-            mb = 2
-    sela = c0 * NIN
-    selb = (c4.bit_and(255) + 256 * mb) * NIN
+    mut mctx := -1
+    m[ST + 9] = 0
+    if mlen > 0
+        e := buf[m[6]].to_int()
+        if (e + 256).shr(8 - bitpos) == c0
+            ebit := e.shr(7 - bitpos).bit_and(1)
+            lb := if mlen < 16 then mlen else 16 + ((mlen - 16) / 8).min(15)
+            mctx = lb * 2 + ebit
+            m[ST + 9] = m[STR + m[MSM + mctx].shr(19)]
+            mb = if mlen < 16 then 1 else if mlen < 32 then 2 else 3
+    m[8] = mctx
+    m[ST + 10] = 256
+    sela := WA + c0 * NIN
+    selb := WB + (c4.bit_and(255) + 256 * mb) * NIN
     mut da := 0
     mut db := 0
     for k in 0..NIN
-        da += wa[sela + k] * st[k]
-        db += wb[selb + k] * st[k]
-    dota = (da / 65536).max(-2047).min(2047)
-    dotb = (db / 65536).max(-2047).min(2047)
-    dotf = ((wf[bitpos * 2] * dota + wf[bitpos * 2 + 1] * dotb) / 65536).max(-2047).min(2047)
-    pmix = squash(dotf).max(1).min(4095)
-    i1 = c0
-    i2 = c0 + c4.bit_and(255).shl(8)
-    p1 := apm(1, i1, pmix)
-    p2 := apm(2, i2, pmix)
-    pr = ((pmix + p1 + 2 * p2) / 4).max(1).min(4095)
-    pr
+        x := m[ST + k]
+        da += m[sela + k] * x
+        db += m[selb + k] * x
+    dota := (da / 65536).max(-2047).min(2047)
+    dotb := (db / 65536).max(-2047).min(2047)
+    wfi := WF + bitpos * 2
+    dotf := ((m[wfi] * dota + m[wfi + 1] * dotb) / 65536).max(-2047).min(2047)
+    pmix := squash(dotf).max(1).min(4095)
+    m[9] = sela
+    m[10] = selb
+    m[11] = dota
+    m[12] = dotb
+    m[13] = dotf
+    m[14] = pmix
+    # SSE: each stage interpolates its context's curve at pmix's logit.
+    sp := m[STR + pmix] + 2048
+    w := sp.bit_and(127)
+    j1 := c0 * 33 + sp.shr(7)
+    j2 := (c0 + c4.bit_and(255).shl(8)) * 33 + sp.shr(7)
+    p1 := (a1[j1].to_int() * (128 - w) + a1[j1 + 1].to_int() * w).shr(11)
+    p2 := (a2[j2].to_int() * (128 - w) + a2[j2 + 1].to_int() * w).shr(11)
+    ((pmix + p1 + 2 * p2) / 4).max(1).min(4095)
 
-fn Model.update(mut self, y int)
+## Learns the bit `y` that `predict` just gave a probability for, and moves on.
+fn update(
+    mut m List[int],
+    mut t List[u8],
+    mut a1 List[u32],
+    mut a2 List[u32],
+    mut buf List[u8],
+    mut mtab List[u32],
+    y int,
+)
+    c0 := m[0]
+    c4 := m[1]
+    bitpos := m[5]
+    nib := m[17]
+    sela := m[9]
+    selb := m[10]
+    dota := m[11]
+    dotb := m[12]
+    pmix := m[14]
+    # A step is (input * error + 32768) / 65536 with inputs within +-2047, so an
+    # error within +-16 moves no weight: those loops are skipped, same bytes.
     ea := (y.shl(12) - squash(dota)) * 6
+    if ea > 16 or ea < -16
+        for k in 0..NIN
+            m[sela + k] += (m[ST + k] * ea + 32768) / 65536
     eb := (y.shl(12) - squash(dotb)) * 6
-    for k in 0..NIN
-        wa[sela + k] += (st[k] * ea + 32768) / 65536
-        wb[selb + k] += (st[k] * eb + 32768) / 65536
+    if eb > 16 or eb < -16
+        for k in 0..NIN
+            m[selb + k] += (m[ST + k] * eb + 32768) / 65536
     ef := (y.shl(12) - pmix) * 2
-    wf[bitpos * 2] += (dota * ef + 32768) / 65536
-    wf[bitpos * 2 + 1] += (dotb * ef + 32768) / 65536
-    s := sq[pmix] + 2048
-    j0 := s.shr(7)
-    near := if s.bit_and(127) < 64 then j0 else j0 + 1
+    wfi := WF + bitpos * 2
+    m[wfi] += (dota * ef + 32768) / 65536
+    m[wfi + 1] += (dotb * ef + 32768) / 65536
+    sp := m[STR + pmix] + 2048
+    j0 := sp.shr(7)
+    near := if sp.bit_and(127) < 64 then j0 else j0 + 1
     g := y.shl(16) + y.shl(7) - y - y
-    j1 := i1 * 33 + near
+    j1 := c0 * 33 + near
     v1 := a1[j1].to_int()
     a1[j1] = (v1 + (g - v1) / 128).to_u32()
-    j2 := i2 * 33 + near
+    j2 := (c0 + c4.bit_and(255).shl(8)) * 33 + near
     v2 := a2[j2].to_int()
     a2[j2] = (v2 + (g - v2) / 128).to_u32()
-    e0 := adapt(o0[c0], y, LIMIT)
-    o0[c0] = e0
+    e0 := m[O0 + c0]
+    m[O0 + c0] = adapt(e0, y, LIMIT, m[DT + e0.bit_and(1023)])
     for i in 0..NORD
-        hs := cur[i]
-        j := i * NSTATES + hs
-        sm[j] = adapt(sm[j], y, LIMIT)
-        t[idx[i]] = nex[hs * 2 + y].to_u8()
+        hs := m[CUR + i]
+        j := SM + i * NSTATES + hs
+        es := m[j]
+        m[j] = adapt(es, y, LIMIT, m[DT + es.bit_and(1023)])
+        t[m[BKT + i] + nib] = m[NEX + hs * 2 + y].to_u8()
+    mctx := m[8]
     if mctx >= 0
-        em := adapt(msm[mctx], y, 1023)
-        msm[mctx] = em
-    c0 = c0 * 2 + y
-    bitpos += 1
-    if bitpos == 8
-        end_byte(c0 - 256)
-        c0 = 1
-        bitpos = 0
-    set_idx()
+        em := m[MSM + mctx]
+        m[MSM + mctx] = adapt(em, y, 1023, m[DT + em.bit_and(1023)])
+    if bitpos == 7
+        end_byte(mut m, mut buf, mut mtab, c0 * 2 + y - 256)
+        m[0] = 1
+        m[5] = 0
+    else
+        m[0] = c0 * 2 + y
+        m[5] = bitpos + 1
+    set_idx(mut m, mut t)
 
-fn Model.end_byte(mut self, b int)
+fn end_byte(mut m List[int], mut buf List[u8], mut mtab List[u32], b int)
     buf.push(b.to_u8())
-    c8 = c8.shl(8).bit_and(4294967295).bit_or(c4.shr(24))
-    c4 = c4.shl(8).bit_and(4294967295).bit_or(b)
+    c8 := m[2].shl(8).bit_and(4294967295).bit_or(m[1].shr(24))
+    c4 := m[1].shl(8).bit_and(4294967295).bit_or(b)
+    m[1] = c4
+    m[2] = c8
+    mut word0 := m[3]
+    mut word1 := m[4]
     lower := if b >= 65 and b <= 90 then b + 32 else b
     if (lower >= 97 and lower <= 122) or b >= 128
         word0 = (word0 * 263 + lower).bit_and(1073741823)
     elif word0 != 0
         word1 = word0
         word0 = 0
-    hv[0] = c4.bit_and(255) * 65599 + 1
-    hv[1] = c4.bit_and(65535) * 31 + 2
-    hv[2] = fold(c4.bit_and(16777215) * 2246822519) + 3
-    hv[3] = fold(c4.shr(16) * 2246822519 + c4.bit_and(65535) * 3266489917) + 4
-    hv[4] = fold(c4.bit_xor(c8.bit_and(65535) * 2654435761)) + 5
+    m[3] = word0
+    m[4] = word1
+    m[HV] = c4.bit_and(255) * 65599 + 1
+    m[HV + 1] = c4.bit_and(65535) * 31 + 2
+    m[HV + 2] = fold(c4.bit_and(16777215) * 2246822519) + 3
+    m[HV + 3] = fold(c4.shr(16) * 2246822519 + c4.bit_and(65535) * 3266489917) + 4
+    m[HV + 4] = fold(c4.bit_xor(c8.bit_and(65535) * 2654435761)) + 5
     n := buf.len()
-    if exe == 0
-        hv[5] = fold(word0 * 2654435761) + 6
-        hv[6] = fold(word0.bit_xor(word1 * 1000003) * 97) + 7
+    if m[20] == 0
+        m[HV + 5] = fold(word0 * 2654435761) + 6
+        m[HV + 6] = fold(word0.bit_xor(word1 * 1000003) * 97) + 7
     else
         # Machine code: bytes 1 and 3 back (an opcode and its operand around a
         # ModRM byte), and the column in a 4-byte word with the bytes 4 and 8 back
         # (the same field of the previous instructions on ARM64, table entries on x86).
-        hv[5] = fold((c4.bit_and(16711935) + 16777216) * 2654435761) + 6
-        hv[6] = fold((n.bit_and(3) + c4.shr(24).shl(2) + c8.shr(24).shl(10)) * 2246822519) + 7
-    hv[7] = fold(c4.shr(8).bit_and(65535) * 2246822519) + 8
+        m[HV + 5] = fold((c4.bit_and(16711935) + 16777216) * 2654435761) + 6
+        m[HV + 6] = fold((n.bit_and(3) + c4.shr(24).shl(2) + c8.shr(24).shl(10)) * 2246822519) + 7
+    m[HV + 7] = fold(c4.shr(8).bit_and(65535) * 2246822519) + 8
+    mut mlen := m[7]
+    mut mptr := m[6]
     if mlen > 0 and buf[mptr].to_int() == b
         mlen += 1
         mptr += 1
     else
         mlen = 0
-    h := (fold(c4 + c8.bit_and(255).shl(32)) * 789008181).shr(20).bit_and((1).shl(mbits) - 1)
+    h := (fold(c4 + c8.bit_and(255).shl(32)) * 789008181).shr(20).bit_and((1).shl(m[19]) - 1)
     if mlen == 0
-        cand := mtab[h].to_int()
+        # Masked for a full-width int, as in predict.
+        cand := mtab[h].to_int().bit_and(4294967295)
         if cand > 0
             mut k := 0
             while k < 32 and cand - 1 - k >= 0 and buf[cand - 1 - k] == buf[n - 1 - k]
@@ -437,28 +440,36 @@ fn Model.end_byte(mut self, b int)
                 mlen = k
                 mptr = cand
     mtab[h] = n.to_u32()
+    m[6] = mptr
+    m[7] = mlen
 
 struct Coder
     out List[u8]
     x1 int
     x2 int
 
-## Compresses `d` to a self-contained block; `exe` as for new_model.
+## Compresses `d` to a self-contained block; `exe` as for new_m.
 pub fn compress(d List[u8], exe int) List[u8]
-    mut m := new_model(d.len(), exe)
+    mut m := new_m(d.len(), exe)
+    mut t := [(0).to_u8() for _ in 0..NORD * (1).shl(m[18])]
+    mut mtab := [(0).to_u32() for _ in 0..(1).shl(m[19])]
+    mut a1 := apm_init(256)
+    mut a2 := apm_init(65536)
+    mut buf := List[u8]()
+    set_idx(mut m, mut t)
     mut c := Coder(out: [], x1: 0, x2: 4294967295)
     for byte in d
         b := byte.to_int()
         mut i := 7
         while i >= 0
             y := b.shr(i).bit_and(1)
-            p := m.predict()
+            p := predict(mut m, t, a1, a2, buf)
             xmid := c.x1 + (c.x2 - c.x1).shr(12) * p
             if y == 1
                 c.x2 = xmid
             else
                 c.x1 = xmid + 1
-            m.update(y)
+            update(mut m, mut t, mut a1, mut a2, mut buf, mut mtab, y)
             while c.x1.bit_xor(c.x2).bit_and(4278190080) == 0
                 c.out.push(c.x2.shr(24).to_u8())
                 c.x1 = c.x1.shl(8).bit_and(4294967295)
@@ -472,7 +483,13 @@ pub fn compress(d List[u8], exe int) List[u8]
 
 ## Decodes `n` bytes. A damaged block gives wrong bytes, which the caller's CRC catches.
 pub fn decompress(src List[u8], n int, exe int) List[u8]
-    mut m := new_model(n, exe)
+    mut m := new_m(n, exe)
+    mut t := [(0).to_u8() for _ in 0..NORD * (1).shl(m[18])]
+    mut mtab := [(0).to_u32() for _ in 0..(1).shl(m[19])]
+    mut a1 := apm_init(256)
+    mut a2 := apm_init(65536)
+    mut buf := List[u8]()
+    set_idx(mut m, mut t)
     mut pos := 0
     mut x := 0
     for _ in 0..4
@@ -480,10 +497,9 @@ pub fn decompress(src List[u8], n int, exe int) List[u8]
         pos += 1
     mut x1 := 0
     mut x2 := 4294967295
-    mut out := List[u8]()
     for _byte in 0..n
         for _bit in 0..8
-            p := m.predict()
+            p := predict(mut m, t, a1, a2, buf)
             xmid := x1 + (x2 - x1).shr(12) * p
             mut y := 0
             if x <= xmid
@@ -491,15 +507,14 @@ pub fn decompress(src List[u8], n int, exe int) List[u8]
                 x2 = xmid
             else
                 x1 = xmid + 1
-            m.update(y)
+            update(mut m, mut t, mut a1, mut a2, mut buf, mut mtab, y)
             while x1.bit_xor(x2).bit_and(4278190080) == 0
                 x1 = x1.shl(8).bit_and(4294967295)
                 x2 = x2.shl(8).bit_and(4294967295).bit_or(255)
                 nb := if pos < src.len() then src[pos].to_int() else 0
                 x = x.shl(8).bit_and(4294967295).bit_or(nb)
                 pos += 1
-        out.push(m.buf[m.buf.len() - 1])
-    out
+    buf
 
 @test fn state_machine_is_closed_and_numbered()
     st := build_states()
