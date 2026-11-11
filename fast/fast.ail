@@ -159,7 +159,16 @@ fn shifts(cnt List[int], l int) List[int]
     lg
 
 ## Encodes symbol s from state x: records the bits it emits, returns the new state.
-fn enc_step(x int, s int, cnt List[int], cum List[int], lg List[int], st List[int], mut ev List[int], mut ek List[int]) int
+fn enc_step(
+    x int,
+    s int,
+    cnt List[int],
+    cum List[int],
+    lg List[int],
+    st List[int],
+    mut ev List[int],
+    mut ek List[int],
+) int
     c := cnt[s]
     nb0 := lg[s]
     nb := if x.shr(nb0) < c then nb0 - 1 else nb0
@@ -388,7 +397,10 @@ pub fn decompress(src List[u8], n int) List[u8]
     hp := (bp + 7) / 8
     if hp + 4 > src.len()
         return []
-    mlen := src[hp].to_int() + src[hp + 1].to_int().shl(8) + src[hp + 2].to_int().shl(16) + src[hp + 3].to_int().shl(24)
+    mlen := src[hp].to_int()
+        + src[hp + 1].to_int().shl(8)
+        + src[hp + 2].to_int().shl(16)
+        + src[hp + 3].to_int().shl(24)
     mstart := hp + 4
     mend := mstart + mlen
     if mend > src.len()
