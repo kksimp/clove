@@ -25,7 +25,7 @@ use lz
 use probe
 use search
 
-MAGIC := b"CLV3"
+MAGIC := b"CLV4"
 ## Blocks per `par for`. The runtime runs a loop on the pool only when it has at least
 ## twice as many iterations as cores (rt.par_worth), so this must exceed 2x any core count.
 BATCH := 64
@@ -259,7 +259,7 @@ fn load_archive(path str) Archive ! CloveError | fs.IoError
 
 fn parse_archive(b bytes, path str) Archive ! CloveError
     if b.len() < HEAD or b[0..4] != MAGIC
-        return Bad(why: "{path} is not a CLV3 archive")
+        return Bad(why: "{path} is not a CLV4 archive")
     nfiles := rd(b, 4, 4)?
     nblk := rd(b, 8, 4)?
     bsize := rd(b, 12, 4)?
