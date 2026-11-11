@@ -141,6 +141,9 @@ fn opt_depths()(int, int)
 fn pack(data bytes, bsize int, engine int, kinds List[int]) Packed
     nb := nblocks(data.len(), bsize)
     od := opt_depths()
+    # Locals, not `od.0` in the loop: a field access there makes `par for` run in order (conc.par.13).
+    odepth := od.0
+    oskip := od.1
     mut parts := [List[u8]() for _ in 0..nb]
     mut crcs := [0 for _ in 0..nb]
     mut ents := [List[int]() for _ in 0..nb]
@@ -166,7 +169,7 @@ fn pack(data bytes, bsize int, engine int, kinds List[int]) Packed
                 elif engine == 4
                     c = fast.compress(src, 8)
                 elif engine == 3
-                    c = lz.compress_tuned(src, od.0, od.1)
+                    c = lz.compress_tuned(src, odepth, oskip)
                 else
                     c = lz.compress(src, 5)
                 parts[i] = if c.len() < blk.len() then c else blk
