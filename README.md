@@ -18,7 +18,7 @@ same bytes. It is the larger program for comparing AIL with C and with 7-Zip.
 bench.sh corpus.txt                               # native build vs gzip/xz/zstd/7z
 ```
 
-## Archive format (`CLV4`)
+## Archive format (`CLV5`)
 
 All integers are little-endian. The whole index is at the front, so one read finds
 any block of any file. The entries' bytes follow each other in index order as one
@@ -27,7 +27,7 @@ so files alike share blocks and a small file starts with a warm model); the stre
 is cut into independent blocks.
 
 ```
-"CLV4" | u32 entry count | u32 block count | u32 block size | u64 stream length
+"CLV5" | u32 entry count | u32 block count | u32 block size | u64 stream length
 per entry: u16 name length | name (UTF-8, relative, no "..") | u8 kind (0 file, 1 directory, 2 link) | u64 size
            | u32 mode | u64 modified ms | u32 newlines before the entry in its first block | u32 newlines in it
 per block: u64 offset into the data | u32 packed length | u32 CRC32 of the raw block | u8 engine: low 4 bits codec (0 stored, 1 cm, 2 lz, 3 fast), next 2 bits executable filter (0 none, 1 x86-64, 2 ARM64)

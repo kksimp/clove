@@ -416,7 +416,7 @@ pub fn decompress(src List[u8], n int) List[u8]
     mut nb2 := 0
     end := src.len()
     mut o := 0
-    mut par := 0
+    mut side := 0
     while o < n
         # refill to more than 48 bits: a literal/length symbol and a distance symbol need 22
         while nb <= 48
@@ -424,16 +424,16 @@ pub fn decompress(src List[u8], n int) List[u8]
                 acc = acc.bit_or(src[p].to_int().shl(nb))
                 p += 1
             nb += 8
-        e := if par == 0 then lt[s0] else lt[s1]
+        e := if side == 0 then lt[s0] else lt[s1]
         bits := e.shr(12).bit_and(15)
         ns := e.bit_and(4095) + acc.bit_and((1).shl(bits) - 1)
         acc = acc.shr(bits)
         nb -= bits
-        if par == 0
+        if side == 0
             s0 = ns
         else
             s1 = ns
-        par = 1 - par
+        side = 1 - side
         sym := e.shr(16)
         if sym < 256
             out[o] = sym.to_u8()
