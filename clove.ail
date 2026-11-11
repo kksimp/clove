@@ -25,7 +25,7 @@ use lz
 use probe
 use search
 
-MAGIC := b"CLV3"
+MAGIC := b"CLV4"
 ## Blocks per `par for`. The runtime runs a loop on the pool only when it has at least
 ## twice as many iterations as cores (rt.par_worth), so this must exceed 2x any core count.
 BATCH := 64
@@ -39,9 +39,13 @@ BLOCK_ENT := 17
 
 USAGE := """
     usage: clove COMMAND ...
-      a [-m fast|opt|max] [-b BLOCK_KB] ARCHIVE PATH...
+      a [-m fast|opt|max | -1..-9] [-b BLOCK_KB] [-x PATTERN]... ARCHIVE PATH...
                                         add (fast: LZ + Huffman, 1 MB blocks; opt: LZ parsed
                                         optimally, range coded; max: context mixing, 4 MB blocks)
+                                        -1..-3 is fast, -4..-7 opt, -8..-9 max; -x skips names
+                                        matching a shell pattern (*, ?), such as -x '*.o' -x .git
+      c FILE [OUT]                      one file to OUT (default FILE.clove), the gzip way
+      d FILE.clove [DIR]                the same as x
       x ARCHIVE [DIR]                   extract into DIR (default .)
       l [--json] ARCHIVE                list
       t [--json] ARCHIVE                test every block
@@ -127,8 +131,19 @@ fn raw_len(size int, bsize int, i int) int
 ## executable filter in the next 2 (0 none, 1 x86-64, 2 ARM64; never on stored blocks).
 ## `engine` is 1 (max: cm), 2 (lz level 5), 3 (opt: lz level 9, coded as lz) or 4 (fast).
 ## `kinds[i]` is the executable filter for block i (the kind of the file at its first byte).
+## The opt engine's search depths: CLOVE_OPT_DEPTH and CLOVE_OPT_SKIP override the
+## defaults (32 and 8), for benchmarks only.
+fn opt_depths()(int, int)
+    depth := (env.get("CLOVE_OPT_DEPTH") else "32").to_int() else 32
+    skip := (env.get("CLOVE_OPT_SKIP") else "8").to_int() else 8
+    (depth, skip)
+
 fn pack(data bytes, bsize int, engine int, kinds List[int]) Packed
     nb := nblocks(data.len(), bsize)
+    od := opt_depths()
+    # Locals, not `od.0` in the loop: a field access there makes `par for` run in order (conc.par.13).
+    odepth := od.0
+    oskip := od.1
     mut parts := [List[u8]() for _ in 0..nb]
     mut crcs := [0 for _ in 0..nb]
     mut ents := [List[int]() for _ in 0..nb]
@@ -153,8 +168,10 @@ fn pack(data bytes, bsize int, engine int, kinds List[int]) Packed
                     c = cm.compress(src, kind)
                 elif engine == 4
                     c = fast.compress(src, 8)
+                elif engine == 3
+                    c = lz.compress_tuned(src, odepth, oskip)
                 else
-                    c = lz.compress(src, if engine == 3 then 9 else 5)
+                    c = lz.compress(src, 5)
                 parts[i] = if c.len() < blk.len() then c else blk
         for i in first..last
             all = all + bytes.from_list(parts[i])
@@ -245,7 +262,7 @@ fn load_archive(path str) Archive ! CloveError | fs.IoError
 
 fn parse_archive(b bytes, path str) Archive ! CloveError
     if b.len() < HEAD or b[0..4] != MAGIC
-        return Bad(why: "{path} is not a CLV3 archive")
+        return Bad(why: "{path} is not a CLV4 archive")
     nfiles := rd(b, 4, 4)?
     nblk := rd(b, 8, 4)?
     bsize := rd(b, 12, 4)?
@@ -340,7 +357,7 @@ fn header_bytes(
     engines List[int],
 ) bytes
     mut h := List[int]()
-    h.extend([67, 76, 86, 51])
+    h.extend([67, 76, 86, 52])
     put(mut h, files.len(), 4)
     put(mut h, clens.len(), 4)
     put(mut h, bsize, 4)
@@ -398,7 +415,41 @@ struct Item
 ## The directories, then the files sorted by extension and name, as 7-Zip orders a
 ## solid archive, so files alike share blocks. Links are not stored yet (skipped with
 ## a note), until AIL can read and make them.
-fn collect(paths List[str]) List[Item] ! CloveError | fs.IoError
+## Does `name` match the shell pattern `pat` (`*`, `?`; a pattern without "/" is tried
+## against the last path part too, so `-x '*.o'` excludes every object file)?
+fn glob_match(pat str, name str) bool
+    p := pat.to_bytes()
+    n := name.to_bytes()
+    mut i := 0
+    mut j := 0
+    mut star := -1
+    mut mark := 0
+    while j < n.len()
+        if i < p.len() and p[i] == 42
+            star = i
+            mark = j
+            i += 1
+        elif i < p.len() and (p[i] == 63 or p[i] == n[j])
+            i += 1
+            j += 1
+        elif star >= 0
+            i = star + 1
+            mark += 1
+            j = mark
+        else
+            return false
+    while i < p.len() and p[i] == 42
+        i += 1
+    i == p.len()
+
+fn excluded(name str, pats List[str]) bool
+    base := name.split("/").last() else name
+    for pat in pats
+        if glob_match(pat, name) or (not pat.contains("/") and glob_match(pat, base))
+            return true
+    false
+
+fn collect(paths List[str], skip List[str]) List[Item] ! CloveError | fs.IoError
     mut dirs := List[Item]()
     mut files := List[Item]()
     for p in paths
@@ -406,6 +457,8 @@ fn collect(paths List[str]) List[Item] ! CloveError | fs.IoError
         if m.is_dir
             dirs.push(Item(path: p, name: stored_name(p), kind: 1, size: 0, mtime: m.modified_ms))
             for e in fs.scan(p, false)?.entries
+                if excluded(stored_name(e.path), skip)
+                    continue
                 if e.is_link
                     io.eprint("clove: skipping the link {e.path}")
                 elif e.is_dir
@@ -492,8 +545,14 @@ fn Writer.add(mut self, piece bytes, kind int) int ! fs.IoError
         flush(false)?
     nl
 
-fn cmd_add(archive str, paths List[str], bsize int, engine int) ! CloveError | fs.IoError
-    items := collect(paths)?
+fn cmd_add(
+    archive str,
+    paths List[str],
+    bsize int,
+    engine int,
+    skip List[str],
+) ! CloveError | fs.IoError
+    items := collect(paths, skip)?
     tmp := "{archive}.tmp"
     fs.write_bytes(tmp, b"")?
     mut w := Writer(
@@ -1076,6 +1135,7 @@ struct Opts
     binary bool
     max int
     only str
+    skip List[str]
     words List[str]
 
 fn parse(args List[str]) Opts ! CloveError
@@ -1090,6 +1150,7 @@ fn parse(args List[str]) Opts ! CloveError
         binary: false,
         max: 200,
         only: "",
+        skip: [],
         words: [],
     )
     mut i := 0
@@ -1115,6 +1176,11 @@ fn parse(args List[str]) Opts ! CloveError
         elif a == "--json"
             o.json = true
             i += 1
+        elif a == "-x"
+            if word == ""
+                return Usage(text: "-x needs a pattern")
+            o.skip.push(word)
+            i += 2
         elif a == "--out"
             o.out = word
             i += 2
@@ -1139,6 +1205,13 @@ fn parse(args List[str]) Opts ! CloveError
             if ends[1] != ""
                 o.hi = ends[1].to_int() else return Usage(text: "--range needs numbers")
             i += 2
+        elif a.len() == 2
+            and a.starts_with("-")
+            and a.chars()[1].code() >= 49
+            and a.chars()[1].code() <= 57
+            lvl := a.chars()[1].code() - 48
+            o.engine = if lvl <= 3 then 4 else if lvl <= 7 then 3 else 1
+            i += 1
         else
             o.words.push(a)
             i += 1
@@ -1162,7 +1235,7 @@ fn main() !
     match args[0]
         "a" =>
             require(w, 2, "a needs ARCHIVE and PATH...")?
-            cmd_add(w[0], w[1..], o.bsize, o.engine)?
+            cmd_add(w[0], w[1..], o.bsize, o.engine, o.skip)?
         "x" =>
             require(w, 1, "x needs ARCHIVE")?
             cmd_extract(w[0], if w.len() > 1 then w[1] else ".")?
@@ -1181,6 +1254,13 @@ fn main() !
         "describe" =>
             require(w, 1, "describe needs ARCHIVE")?
             cmd_describe(w[0], o.json)?
+        "c" =>
+            require(w, 1, "c needs FILE")?
+            out := if w.len() > 1 then w[1] else "{w[0]}.clove"
+            cmd_add(out, [w[0]], o.bsize, o.engine, o.skip)?
+        "d" =>
+            require(w, 1, "d needs FILE.clove")?
+            cmd_extract(w[0], if w.len() > 1 then w[1] else ".")?
         "serve" => cmd_serve()
         "bench" =>
             require(w, 1, "bench needs FILE")?
@@ -1216,12 +1296,33 @@ fn same_file(a str, b str) bool ! fs.IoError
         root := "{TEST_DIR}/rt{engine}"
         make_tree("{root}/in")?
         arc := "{root}/t.clove"
-        cmd_add(arc, ["{root}/in"], 4096, engine)?
+        cmd_add(arc, ["{root}/in"], 4096, engine, [])?
         cmd_test(arc, false)?
         cmd_extract(arc, "{root}/out")?
         for f in ["empty.txt", "src/one.txt", "src/deep/big.bin", "src/deep/er/exact.bin"]
             assert(same_file("{root}/in/{f}", "{root}/out/{root}/in/{f}")?)
         assert(fs.metadata("{root}/out/{root}/in/emptydir")?.is_dir)
+
+@test fn excludes_match_shell_patterns()
+    assert(glob_match("*.o", "a.o"))
+    assert(glob_match("src/*/x.txt", "src/deep/x.txt"))
+    assert(not glob_match("*.o", "a.c"))
+    assert(glob_match("a?c", "abc"))
+    assert(glob_match("**", ""))
+    assert(excluded("src/deep/thing.o", ["*.o"]))
+    assert(excluded("proj/.git/config", [".git"]) == false)
+    assert(excluded("proj/.git", [".git"]))
+    assert(not excluded("src/main.ail", ["*.o", "*.tmp"]))
+
+@test fn excluded_entries_stay_out()
+    root := "{TEST_DIR}/excl"
+    make_tree("{root}/in")?
+    arc := "{root}/t.clove"
+    cmd_add(arc, ["{root}/in"], 4096, 4, ["*.bin"])?
+    a := load_archive(arc)?
+    for f in a.files
+        assert(not f.name.ends_with(".bin"))
+    assert(a.files.len() >= 3)
 
 ## Small files share blocks; grep still names the file and numbers lines from its start.
 @test fn solid_blocks_keep_files_and_line_numbers_apart()
@@ -1233,7 +1334,7 @@ fn same_file(a str, b str) bool ! fs.IoError
             text = "{text}file {k} line {l} {if l == k then "needle" else "hay"}\n"
         fs.write_text("{root}/in/f{k:0>2}.txt", text)?
     arc := "{root}/t.clove"
-    cmd_add(arc, ["{root}/in"], 4096, 2)?
+    cmd_add(arc, ["{root}/in"], 4096, 2, [])?
     a := load_archive(arc)?
     assert(a.offs.len() < 20)
     r := run_grep(arc, "needle", false, false, 100, "")?
@@ -1252,7 +1353,7 @@ fn same_file(a str, b str) bool ! fs.IoError
     root := "{TEST_DIR}/range"
     make_tree("{root}/in")?
     arc := "{root}/t.clove"
-    cmd_add(arc, ["{root}/in/src/deep/big.bin"], 4096, 2)?
+    cmd_add(arc, ["{root}/in/src/deep/big.bin"], 4096, 2, [])?
     whole := fs.read_bytes("{root}/in/src/deep/big.bin")?
     name := "{root}/in/src/deep/big.bin"
     los := [0, 4095, 4096, 8191, 69999, 0, 100]
@@ -1266,7 +1367,7 @@ fn same_file(a str, b str) bool ! fs.IoError
     root := "{TEST_DIR}/bad"
     make_tree("{root}/in")?
     arc := "{root}/t.clove"
-    cmd_add(arc, ["{root}/in/src"], 4096, 2)?
+    cmd_add(arc, ["{root}/in/src"], 4096, 2, [])?
     good := fs.read_bytes(arc)?
     a0 := parse_archive(good, "good")?
     last := a0.offs.len() - 1
@@ -1336,7 +1437,7 @@ fn same_file(a str, b str) bool ! fs.IoError
     fs.write_bytes("{root}/prog", bytes.from_list(prog))?
     for engine in [4, 2, 1]
         arc := "{root}/p{engine}.clove"
-        cmd_add(arc, ["{root}/prog"], 4096, engine)?
+        cmd_add(arc, ["{root}/prog"], 4096, engine, [])?
         a := parse_archive(fs.read_bytes(arc)?, arc)?
         assert_eq(a.engines[0].shr(4), 1)
         cmd_extract(arc, "{root}/out{engine}")?
