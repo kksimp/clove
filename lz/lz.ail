@@ -33,40 +33,40 @@ struct Enc
     p List[int]
 
 fn Enc.shift_low(mut self)
-    if lo < 4278190080 or lo >= 4294967296
-        carry := lo.shr(32)
-        out.push((cache + carry).bit_and(255).to_u8())
-        csize -= 1
-        while csize > 0
-            out.push((255 + carry).bit_and(255).to_u8())
-            csize -= 1
-        cache = lo.shr(24).bit_and(255)
-    csize += 1
-    lo = lo.bit_and(16777215).shl(8)
+    if self.lo < 4278190080 or self.lo >= 4294967296
+        carry := self.lo.shr(32)
+        self.out.push((self.cache + carry).bit_and(255).to_u8())
+        self.csize -= 1
+        while self.csize > 0
+            self.out.push((255 + carry).bit_and(255).to_u8())
+            self.csize -= 1
+        self.cache = self.lo.shr(24).bit_and(255)
+    self.csize += 1
+    self.lo = self.lo.bit_and(16777215).shl(8)
 
 fn Enc.bit(mut self, i int, b int)
-    pr := p[i]
-    bound := rng.shr(11) * pr
+    pr := self.p[i]
+    bound := self.rng.shr(11) * pr
     if b == 0
-        rng = bound
-        p[i] = pr + (2048 - pr).shr(5)
+        self.rng = bound
+        self.p[i] = pr + (2048 - pr).shr(5)
     else
-        lo += bound
-        rng -= bound
-        p[i] = pr - pr.shr(5)
-    while rng < TOP
-        rng = rng.shl(8)
-        shift_low()
+        self.lo += bound
+        self.rng -= bound
+        self.p[i] = pr - pr.shr(5)
+    while self.rng < TOP
+        self.rng = self.rng.shl(8)
+        self.shift_low()
 
 fn Enc.direct(mut self, v int, nbits int)
     mut i := nbits - 1
     while i >= 0
-        rng = rng.shr(1)
+        self.rng = self.rng.shr(1)
         if v.shr(i).bit_and(1) == 1
-            lo += rng
-        while rng < TOP
-            rng = rng.shl(8)
-            shift_low()
+            self.lo += self.rng
+        while self.rng < TOP
+            self.rng = self.rng.shl(8)
+            self.shift_low()
         i -= 1
 
 fn Enc.tree(mut self, base int, nbits int, v int)
@@ -74,7 +74,7 @@ fn Enc.tree(mut self, base int, nbits int, v int)
     mut i := nbits - 1
     while i >= 0
         b := v.shr(i).bit_and(1)
-        bit(base + m, b)
+        self.bit(base + m, b)
         m = m * 2 + b
         i -= 1
 
@@ -82,7 +82,7 @@ fn Enc.rtree(mut self, base int, nbits int, v int)
     mut m := 1
     for i in 0..nbits
         b := v.shr(i).bit_and(1)
-        bit(base + m, b)
+        self.bit(base + m, b)
         m = m * 2 + b
 
 fn Enc.lit(mut self, prevb int, v int, mb int, matched bool)
@@ -94,27 +94,27 @@ fn Enc.lit(mut self, prevb int, v int, mb int, matched bool)
         b := v.shr(i).bit_and(1)
         if mt
             mbit := mb.shr(i).bit_and(1)
-            bit(base + 256 + mbit * 256 + m, b)
+            self.bit(base + 256 + mbit * 256 + m, b)
             if mbit != b
                 mt = false
         else
-            bit(base + m, b)
+            self.bit(base + m, b)
         m = m * 2 + b
         i -= 1
 
 ## Length l - 2 (0..271) with a context of the position mod 4.
 fn Enc.mlen(mut self, base int, l int, ps int)
     if l < 8
-        bit(base, 0)
-        tree(base + 2 + ps * 8, 3, l)
+        self.bit(base, 0)
+        self.tree(base + 2 + ps * 8, 3, l)
     elif l < 16
-        bit(base, 1)
-        bit(base + 1, 0)
-        tree(base + 34 + ps * 8, 3, l - 8)
+        self.bit(base, 1)
+        self.bit(base + 1, 0)
+        self.tree(base + 34 + ps * 8, 3, l - 8)
     else
-        bit(base, 1)
-        bit(base + 1, 1)
-        tree(base + 66, 8, l - 16)
+        self.bit(base, 1)
+        self.bit(base + 1, 1)
+        self.tree(base + 66, 8, l - 16)
 
 fn slot_of(d int) int
     if d < 4
@@ -129,16 +129,16 @@ fn slot_of(d int) int
 fn Enc.dist(mut self, l int, d int)
     s := slot_of(d)
     ctx := if l > 3 then 3 else l
-    tree(SLOT + ctx * 64, 6, s)
+    self.tree(SLOT + ctx * 64, 6, s)
     if s >= 4
         n := s.shr(1) - 1
         base := (2 + s.bit_and(1)).shl(n)
         e := d - base
         if n > 4
-            direct(e.shr(4), n - 4)
-            rtree(ALIGN, 4, e.bit_and(15))
+            self.direct(e.shr(4), n - 4)
+            self.rtree(ALIGN, 4, e.bit_and(15))
         else
-            rtree(SPEC + s * 16, n, e)
+            self.rtree(SPEC + s * 16, n, e)
 
 fn after_lit(s int) int
     if s < 4
@@ -546,34 +546,34 @@ fn Enc.emit(mut self, d List[u8], pos int, state int, mut reps List[int], code i
     ps := pos.bit_and(3)
     if code == -1
         mb := if pos > reps[0] then d[pos - reps[0] - 1].to_int() else -1
-        bit(IS_MATCH + state * 4 + ps, 0)
+        self.bit(IS_MATCH + state * 4 + ps, 0)
         prevb := if pos > 0 then d[pos - 1].to_int() else 0
-        lit(prevb, d[pos].to_int(), mb, state >= 7)
+        self.lit(prevb, d[pos].to_int(), mb, state >= 7)
         return after_lit(state)
-    bit(IS_MATCH + state * 4 + ps, 1)
+    self.bit(IS_MATCH + state * 4 + ps, 1)
     if code == -2
-        bit(IS_REP + state, 1)
-        bit(IS_G0 + state, 0)
-        bit(IS_LONG + state * 4 + ps, 0)
+        self.bit(IS_REP + state, 1)
+        self.bit(IS_G0 + state, 0)
+        self.bit(IS_LONG + state * 4 + ps, 0)
         return after_short(state)
     if code < 4
-        bit(IS_REP + state, 1)
+        self.bit(IS_REP + state, 1)
         if code == 0
-            bit(IS_G0 + state, 0)
-            bit(IS_LONG + state * 4 + ps, 1)
+            self.bit(IS_G0 + state, 0)
+            self.bit(IS_LONG + state * 4 + ps, 1)
         else
-            bit(IS_G0 + state, 1)
+            self.bit(IS_G0 + state, 1)
             if code == 1
-                bit(IS_G1 + state, 0)
+                self.bit(IS_G1 + state, 0)
             else
-                bit(IS_G1 + state, 1)
-                bit(IS_G2 + state, code - 2)
+                self.bit(IS_G1 + state, 1)
+                self.bit(IS_G2 + state, code - 2)
             rep_front(mut reps, code)
-        mlen(LEN_REP, l - 2, ps)
+        self.mlen(LEN_REP, l - 2, ps)
         return after_rep(state)
-    bit(IS_REP + state, 0)
-    mlen(LEN_MATCH, l - 2, ps)
-    dist(l - 2, code - 4)
+    self.bit(IS_REP + state, 0)
+    self.mlen(LEN_MATCH, l - 2, ps)
+    self.dist(l - 2, code - 4)
     rep_push(mut reps, code - 4)
     after_match(state)
 
@@ -868,50 +868,50 @@ struct Dec
     p List[int]
 
 fn Dec.norm(mut self)
-    if rng < TOP
-        rng = rng.shl(8)
-        nb := if pos < src.len() then src[pos].to_int() else 0
-        code = code.shl(8).bit_or(nb)
-        pos += 1
+    if self.rng < TOP
+        self.rng = self.rng.shl(8)
+        nb := if self.pos < self.src.len() then self.src[self.pos].to_int() else 0
+        self.code = self.code.shl(8).bit_or(nb)
+        self.pos += 1
 
 fn Dec.bit(mut self, i int) int
-    pr := p[i]
-    bound := rng.shr(11) * pr
+    pr := self.p[i]
+    bound := self.rng.shr(11) * pr
     mut b := 0
-    if code < bound
-        rng = bound
-        p[i] = pr + (2048 - pr).shr(5)
+    if self.code < bound
+        self.rng = bound
+        self.p[i] = pr + (2048 - pr).shr(5)
     else
-        code -= bound
-        rng -= bound
-        p[i] = pr - pr.shr(5)
+        self.code -= bound
+        self.rng -= bound
+        self.p[i] = pr - pr.shr(5)
         b = 1
-    norm()
+    self.norm()
     b
 
 fn Dec.direct(mut self, nbits int) int
     mut v := 0
     for _ in 0..nbits
-        rng = rng.shr(1)
+        self.rng = self.rng.shr(1)
         mut b := 0
-        if code >= rng
-            code -= rng
+        if self.code >= self.rng
+            self.code -= self.rng
             b = 1
         v = v.shl(1).bit_or(b)
-        norm()
+        self.norm()
     v
 
 fn Dec.tree(mut self, base int, nbits int) int
     mut m := 1
     for _ in 0..nbits
-        m = m * 2 + bit(base + m)
+        m = m * 2 + self.bit(base + m)
     m - (1).shl(nbits)
 
 fn Dec.rtree(mut self, base int, nbits int) int
     mut m := 1
     mut v := 0
     for i in 0..nbits
-        b := bit(base + m)
+        b := self.bit(base + m)
         m = m * 2 + b
         v = v.bit_or(b.shl(i))
     v
@@ -925,34 +925,34 @@ fn Dec.lit(mut self, prevb int, mb int, matched bool) int
         mut b := 0
         if mt
             mbit := mb.shr(i).bit_and(1)
-            b = bit(base + 256 + mbit * 256 + m)
+            b = self.bit(base + 256 + mbit * 256 + m)
             if mbit != b
                 mt = false
         else
-            b = bit(base + m)
+            b = self.bit(base + m)
         m = m * 2 + b
         i -= 1
     m - 256
 
 fn Dec.mlen(mut self, base int, ps int) int
-    if bit(base) == 0
-        return tree(base + 2 + ps * 8, 3)
-    if bit(base + 1) == 0
-        return 8 + tree(base + 34 + ps * 8, 3)
-    16 + tree(base + 66, 8)
+    if self.bit(base) == 0
+        return self.tree(base + 2 + ps * 8, 3)
+    if self.bit(base + 1) == 0
+        return 8 + self.tree(base + 34 + ps * 8, 3)
+    16 + self.tree(base + 66, 8)
 
 fn Dec.dist(mut self, l int) int
     ctx := if l > 3 then 3 else l
-    s := tree(SLOT + ctx * 64, 6)
+    s := self.tree(SLOT + ctx * 64, 6)
     if s < 4
         return s
     n := s.shr(1) - 1
     base := (2 + s.bit_and(1)).shl(n)
     if n > 4
-        hi := direct(n - 4)
-        lo := rtree(ALIGN, 4)
+        hi := self.direct(n - 4)
+        lo := self.rtree(ALIGN, 4)
         return base + hi.shl(4) + lo
-    base + rtree(SPEC + s * 16, n)
+    base + self.rtree(SPEC + s * 16, n)
 
 ## Decodes `n` bytes from a block made by `compress`. A damaged block gives
 ## an empty list (the caller checks the length and the CRC).

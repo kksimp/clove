@@ -513,36 +513,36 @@ struct Writer
 
 ## Packs the whole blocks in `buf` (all of it when `last`).
 fn Writer.flush(mut self, last bool) ! fs.IoError
-    whole := buf.len() / bsize * bsize
-    n := if last then buf.len() else whole
+    whole := self.buf.len() / self.bsize * self.bsize
+    n := if last then self.buf.len() else whole
     if n == 0
         return
-    data := bytes.from_list(buf[0..n])
-    nb := nblocks(n, bsize)
-    p := pack(data, bsize, engine, kinds[0..nb])
-    fs.append_bytes(tmp, p.data)?
-    clens.extend(p.clens)
-    crcs.extend(p.crcs)
-    engines.extend(p.engines)
-    index.extend(p.index)
-    buf = buf[n..buf.len()]
-    kinds = kinds[nb..kinds.len()]
-    flushed += n
+    data := bytes.from_list(self.buf[0..n])
+    nb := nblocks(n, self.bsize)
+    p := pack(data, self.bsize, self.engine, self.kinds[0..nb])
+    fs.append_bytes(self.tmp, p.data)?
+    self.clens.extend(p.clens)
+    self.crcs.extend(p.crcs)
+    self.engines.extend(p.engines)
+    self.index.extend(p.index)
+    self.buf = self.buf[n..self.buf.len()]
+    self.kinds = self.kinds[nb..self.kinds.len()]
+    self.flushed += n
 
 ## Appends one piece of a file whose executable kind is `kind`; returns its newlines.
 fn Writer.add(mut self, piece bytes, kind int) int ! fs.IoError
     mut nl := 0
     for i in 0..piece.len()
-        if (pos + i) % bsize == 0
-            kinds.push(kind)
-            nl_run = 0
+        if (self.pos + i) % self.bsize == 0
+            self.kinds.push(kind)
+            self.nl_run = 0
         if piece[i] == 10
             nl += 1
-            nl_run += 1
-    buf.extend(piece.to_list())
-    pos += piece.len()
-    if buf.len() >= BATCH * bsize
-        flush(false)?
+            self.nl_run += 1
+    self.buf.extend(piece.to_list())
+    self.pos += piece.len()
+    if self.buf.len() >= BATCH * self.bsize
+        self.flush(false)?
     nl
 
 fn cmd_add(
@@ -1291,7 +1291,7 @@ fn make_tree(root str) ! fs.IoError
 fn same_file(a str, b str) bool ! fs.IoError
     fs.read_bytes(a)? == fs.read_bytes(b)?
 
-@test fn add_extract_round_trip_both_engines()
+@needs(fs) @test fn add_extract_round_trip_both_engines()
     for engine in [4, 2, 1]
         root := "{TEST_DIR}/rt{engine}"
         make_tree("{root}/in")?
@@ -1314,7 +1314,7 @@ fn same_file(a str, b str) bool ! fs.IoError
     assert(excluded("proj/.git", [".git"]))
     assert(not excluded("src/main.ail", ["*.o", "*.tmp"]))
 
-@test fn excluded_entries_stay_out()
+@needs(fs) @test fn excluded_entries_stay_out()
     root := "{TEST_DIR}/excl"
     make_tree("{root}/in")?
     arc := "{root}/t.clove"
@@ -1325,7 +1325,7 @@ fn same_file(a str, b str) bool ! fs.IoError
     assert(a.files.len() >= 3)
 
 ## Small files share blocks; grep still names the file and numbers lines from its start.
-@test fn solid_blocks_keep_files_and_line_numbers_apart()
+@needs(fs) @test fn solid_blocks_keep_files_and_line_numbers_apart()
     root := "{TEST_DIR}/solid"
     fs.make_dir("{root}/in")?
     for k in 0..20
@@ -1349,7 +1349,7 @@ fn same_file(a str, b str) bool ! fs.IoError
     one := read_part(arc, "{root}/in/f07.txt", 7, 20)?
     assert_eq(one.text(), fs.read_text("{root}/in/f07.txt")?.slice(7, 20))
 
-@test fn range_reads_at_block_boundaries()
+@needs(fs) @test fn range_reads_at_block_boundaries()
     root := "{TEST_DIR}/range"
     make_tree("{root}/in")?
     arc := "{root}/t.clove"
@@ -1363,7 +1363,7 @@ fn same_file(a str, b str) bool ! fs.IoError
         if los[i] < his[i]
             assert(fs.read_bytes("{root}/part")? == whole[los[i]..his[i]])
 
-@test fn damaged_archives_give_format_errors()
+@needs(fs) @test fn damaged_archives_give_format_errors()
     root := "{TEST_DIR}/bad"
     make_tree("{root}/in")?
     arc := "{root}/t.clove"
@@ -1417,7 +1417,7 @@ fn same_file(a str, b str) bool ! fs.IoError
     assert_eq(stored_name("/abs/path.txt"), "abs/path.txt")
     assert_eq(stored_name(".\\win\\path.txt"), "win/path.txt")
 
-@test fn executables_round_trip_through_the_filter()
+@needs(fs) @test fn executables_round_trip_through_the_filter()
     root := "{TEST_DIR}/exe"
     fs.make_dir(root)?
     mut prog := b"\x7fELF".to_list()

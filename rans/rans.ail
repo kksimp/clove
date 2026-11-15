@@ -225,7 +225,7 @@ pub fn Nib.open(data List[u8], start int, nctx int) Nib
 pub fn Nib.cum(self, ctx int, s int) int
     mut c := 0
     for j in 0..s
-        c += p[ctx * 16 + j]
+        c += self.p[ctx * 16 + j]
     c
 
 ## Move context `ctx` toward symbol `s`; the total stays 65536.
@@ -233,26 +233,26 @@ pub fn Nib.update(mut self, ctx int, s int)
     base := ctx * 16
     mut tot := 0
     for j in 0..16
-        v := p[base + j] - p[base + j].shr(5)
-        p[base + j] = v
+        v := self.p[base + j] - self.p[base + j].shr(5)
+        self.p[base + j] = v
         tot += v
-    p[base + s] += NM - tot
+    self.p[base + s] += NM - tot
 
 ## Decode one nibble in context `ctx`, then adapt.
 pub fn Nib.next(mut self, ctx int) int
-    r := x.bit_and(65535)
+    r := self.x.bit_and(65535)
     base := ctx * 16
     mut s := 0
     mut c := 0
-    while r >= c + p[base + s]
-        c += p[base + s]
+    while r >= c + self.p[base + s]
+        c += self.p[base + s]
         s += 1
-    x = p[base + s] * x.shr(16) + r - c
-    while x < RLOW
-        nb := if pos < src.len() then src[pos].to_int() else 0
-        x = x.shl(8).bit_or(nb)
-        pos += 1
-    update(ctx, s)
+    self.x = self.p[base + s] * self.x.shr(16) + r - c
+    while self.x < RLOW
+        nb := if self.pos < self.src.len() then self.src[self.pos].to_int() else 0
+        self.x = self.x.shl(8).bit_or(nb)
+        self.pos += 1
+    self.update(ctx, s)
     s
 
 ## The adaptive stream of `syms` (values below 16) where symbol i is coded in context

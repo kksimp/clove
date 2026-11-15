@@ -278,33 +278,34 @@ fn new_model(n int, exe int) Model
 ## instead of eight. Slot 0 holds a check byte from other bits of the hash: a
 ## bucket that belongs to a different context is cleared before use.
 fn Model.set_idx(mut self)
-    if bitpos == 0 or bitpos == 4
-        bmask := (1).shl(tbits - 4) - 1
+    if self.bitpos == 0 or self.bitpos == 4
+        bmask := (1).shl(self.tbits - 4) - 1
         for i in 0..NORD
-            h := (hv[i] + c0 * 40503) * 2654435761
-            bkt[i] = h.shr(20).bit_and(bmask).shl(4) + i.shl(tbits)
+            h := (self.hv[i] + self.c0 * 40503) * 2654435761
+            self.bkt[i] = h.shr(20).bit_and(bmask).shl(4) + i.shl(self.tbits)
             check := h.shr(44).bit_and(255)
-            if t[bkt[i]].to_int() != check
-                t[bkt[i]] = check.to_u8()
+            if self.t[self.bkt[i]].to_int() != check
+                self.t[self.bkt[i]] = check.to_u8()
                 for k in 1..16
-                    t[bkt[i] + k] = (0).to_u8()
-    nib := if bitpos < 4 then c0 else (1).shl(bitpos - 4) + c0.bit_and((1).shl(bitpos - 4) - 1)
+                    self.t[self.bkt[i] + k] = (0).to_u8()
+    nib := if self.bitpos < 4 then self.c0 else (1).shl(self.bitpos - 4)
+        + self.c0.bit_and((1).shl(self.bitpos - 4) - 1)
     for i in 0..NORD
-        idx[i] = bkt[i] + nib
+        self.idx[i] = self.bkt[i] + nib
 
 ## SSE: interpolate the curve of context `cx` (stage 1 or 2) at p's logit.
 fn Model.apm(mut self, stage int, cx int, p int) int
-    s := sq[p] + 2048
+    s := self.sq[p] + 2048
     j := cx * 33 + s.shr(7)
     w := s.bit_and(127)
     if stage == 1
-        return (a1[j].to_int() * (128 - w) + a1[j + 1].to_int() * w).shr(11)
-    (a2[j].to_int() * (128 - w) + a2[j + 1].to_int() * w).shr(11)
+        return (self.a1[j].to_int() * (128 - w) + self.a1[j + 1].to_int() * w).shr(11)
+    (self.a2[j].to_int() * (128 - w) + self.a2[j + 1].to_int() * w).shr(11)
 
 fn Model.adapt(mut self, e int, y int, limit int) int
     n := e.bit_and(1023)
     p := e.shr(10)
-    p2 := p + ((y.shl(21) - p) * dt[n]) / 65536
+    p2 := p + ((y.shl(21) - p) * self.dt[n]) / 65536
     n2 := if n < limit then n + 1 else n
     p2.shl(10) + n2
 
@@ -312,131 +313,136 @@ fn Model.adapt(mut self, e int, y int, limit int) int
 ## 1..8 the histories' logits, 9 the match model, 10 a bias, 11..18 the histories'
 ## linear leans (0 for a context never seen).
 fn Model.predict(mut self) int
-    st[0] = sq[o0[c0].shr(19)]
+    self.st[0] = self.sq[self.o0[self.c0].shr(19)]
     for i in 0..NORD
         # The mask makes a full-width int for `cur`: AIL before 53fa67de stored
         # a widened sized value at its narrow width (type.num.15).
-        s := t[idx[i]].to_int().bit_and(255)
-        cur[i] = s
-        p := sm[i * NSTATES + s].shr(19)
-        st[i + 1] = sq[p]
-        st[11 + i] = if s == 0 then 0 else (p - 2048) / 4
+        s := self.t[self.idx[i]].to_int().bit_and(255)
+        self.cur[i] = s
+        p := self.sm[i * NSTATES + s].shr(19)
+        self.st[i + 1] = self.sq[p]
+        self.st[11 + i] = if s == 0 then 0 else (p - 2048) / 4
     mut active := 0
-    st[9] = 0
-    mctx = -1
-    if mlen > 0
-        e := buf[mptr].to_int()
-        if (e + 256).shr(8 - bitpos) == c0
+    self.st[9] = 0
+    self.mctx = -1
+    if self.mlen > 0
+        e := self.buf[self.mptr].to_int()
+        if (e + 256).shr(8 - self.bitpos) == self.c0
             active = 1
-            eb := e.shr(7 - bitpos).bit_and(1)
-            lb := if mlen < 16 then mlen else 16 + ((mlen - 16) / 8).min(15)
-            mctx = lb * 2 + eb
-            st[9] = sq[msm[mctx].shr(19)]
-    st[10] = 256
+            eb := e.shr(7 - self.bitpos).bit_and(1)
+            lb := if self.mlen < 16 then self.mlen else 16 + ((self.mlen - 16) / 8).min(15)
+            self.mctx = lb * 2 + eb
+            self.st[9] = self.sq[self.msm[self.mctx].shr(19)]
+    self.st[10] = 256
     mut mb := 0
     if active == 1
         mb = 3
-        if mlen < 16
+        if self.mlen < 16
             mb = 1
-        elif mlen < 32
+        elif self.mlen < 32
             mb = 2
-    sela = c0 * NIN
-    selb = (c4.bit_and(255) + 256 * mb) * NIN
+    self.sela = self.c0 * NIN
+    self.selb = (self.c4.bit_and(255) + 256 * mb) * NIN
     mut da := 0
     mut db := 0
     for k in 0..NIN
-        da += wa[sela + k] * st[k]
-        db += wb[selb + k] * st[k]
-    dota = (da / 65536).max(-2047).min(2047)
-    dotb = (db / 65536).max(-2047).min(2047)
-    dotf = ((wf[bitpos * 2] * dota + wf[bitpos * 2 + 1] * dotb) / 65536).max(-2047).min(2047)
-    pmix = squash(dotf).max(1).min(4095)
-    i1 = c0
-    i2 = c0 + c4.bit_and(255).shl(8)
-    p1 := apm(1, i1, pmix)
-    p2 := apm(2, i2, pmix)
-    pr = ((pmix + p1 + 2 * p2) / 4).max(1).min(4095)
-    pr
+        da += self.wa[self.sela + k] * self.st[k]
+        db += self.wb[self.selb + k] * self.st[k]
+    self.dota = (da / 65536).max(-2047).min(2047)
+    self.dotb = (db / 65536).max(-2047).min(2047)
+    self.dotf = ((self.wf[self.bitpos * 2] * self.dota + self.wf[self.bitpos * 2 + 1] * self.dotb) / 65536)
+        .max(-2047)
+        .min(2047)
+    self.pmix = squash(self.dotf).max(1).min(4095)
+    self.i1 = self.c0
+    self.i2 = self.c0 + self.c4.bit_and(255).shl(8)
+    p1 := self.apm(1, self.i1, self.pmix)
+    p2 := self.apm(2, self.i2, self.pmix)
+    self.pr = ((self.pmix + p1 + 2 * p2) / 4).max(1).min(4095)
+    self.pr
 
 fn Model.update(mut self, y int)
-    ea := (y.shl(12) - squash(dota)) * 6
-    eb := (y.shl(12) - squash(dotb)) * 6
+    ea := (y.shl(12) - squash(self.dota)) * 6
+    eb := (y.shl(12) - squash(self.dotb)) * 6
     for k in 0..NIN
-        wa[sela + k] += (st[k] * ea + 32768) / 65536
-        wb[selb + k] += (st[k] * eb + 32768) / 65536
-    ef := (y.shl(12) - pmix) * 2
-    wf[bitpos * 2] += (dota * ef + 32768) / 65536
-    wf[bitpos * 2 + 1] += (dotb * ef + 32768) / 65536
-    s := sq[pmix] + 2048
+        self.wa[self.sela + k] += (self.st[k] * ea + 32768) / 65536
+        self.wb[self.selb + k] += (self.st[k] * eb + 32768) / 65536
+    ef := (y.shl(12) - self.pmix) * 2
+    self.wf[self.bitpos * 2] += (self.dota * ef + 32768) / 65536
+    self.wf[self.bitpos * 2 + 1] += (self.dotb * ef + 32768) / 65536
+    s := self.sq[self.pmix] + 2048
     j0 := s.shr(7)
     near := if s.bit_and(127) < 64 then j0 else j0 + 1
     g := y.shl(16) + y.shl(7) - y - y
-    j1 := i1 * 33 + near
-    v1 := a1[j1].to_int()
-    a1[j1] = (v1 + (g - v1) / 128).to_u32()
-    j2 := i2 * 33 + near
-    v2 := a2[j2].to_int()
-    a2[j2] = (v2 + (g - v2) / 128).to_u32()
-    e0 := adapt(o0[c0], y, LIMIT)
-    o0[c0] = e0
+    j1 := self.i1 * 33 + near
+    v1 := self.a1[j1].to_int()
+    self.a1[j1] = (v1 + (g - v1) / 128).to_u32()
+    j2 := self.i2 * 33 + near
+    v2 := self.a2[j2].to_int()
+    self.a2[j2] = (v2 + (g - v2) / 128).to_u32()
+    e0 := self.adapt(self.o0[self.c0], y, LIMIT)
+    self.o0[self.c0] = e0
     for i in 0..NORD
-        hs := cur[i]
+        hs := self.cur[i]
         j := i * NSTATES + hs
-        sm[j] = adapt(sm[j], y, LIMIT)
-        t[idx[i]] = nex[hs * 2 + y].to_u8()
-    if mctx >= 0
-        em := adapt(msm[mctx], y, 1023)
-        msm[mctx] = em
-    c0 = c0 * 2 + y
-    bitpos += 1
-    if bitpos == 8
-        end_byte(c0 - 256)
-        c0 = 1
-        bitpos = 0
-    set_idx()
+        self.sm[j] = self.adapt(self.sm[j], y, LIMIT)
+        self.t[self.idx[i]] = self.nex[hs * 2 + y].to_u8()
+    if self.mctx >= 0
+        em := self.adapt(self.msm[self.mctx], y, 1023)
+        self.msm[self.mctx] = em
+    self.c0 = self.c0 * 2 + y
+    self.bitpos += 1
+    if self.bitpos == 8
+        self.end_byte(self.c0 - 256)
+        self.c0 = 1
+        self.bitpos = 0
+    self.set_idx()
 
 fn Model.end_byte(mut self, b int)
-    buf.push(b.to_u8())
-    c8 = c8.shl(8).bit_and(4294967295).bit_or(c4.shr(24))
-    c4 = c4.shl(8).bit_and(4294967295).bit_or(b)
+    self.buf.push(b.to_u8())
+    self.c8 = self.c8.shl(8).bit_and(4294967295).bit_or(self.c4.shr(24))
+    self.c4 = self.c4.shl(8).bit_and(4294967295).bit_or(b)
     lower := if b >= 65 and b <= 90 then b + 32 else b
     if (lower >= 97 and lower <= 122) or b >= 128
-        word0 = (word0 * 263 + lower).bit_and(1073741823)
-    elif word0 != 0
-        word1 = word0
-        word0 = 0
-    hv[0] = c4.bit_and(255) * 65599 + 1
-    hv[1] = c4.bit_and(65535) * 31 + 2
-    hv[2] = fold(c4.bit_and(16777215) * 2246822519) + 3
-    hv[3] = fold(c4.shr(16) * 2246822519 + c4.bit_and(65535) * 3266489917) + 4
-    hv[4] = fold(c4.bit_xor(c8.bit_and(65535) * 2654435761)) + 5
-    n := buf.len()
-    if exe == 0
-        hv[5] = fold(word0 * 2654435761) + 6
-        hv[6] = fold(word0.bit_xor(word1 * 1000003) * 97) + 7
+        self.word0 = (self.word0 * 263 + lower).bit_and(1073741823)
+    elif self.word0 != 0
+        self.word1 = self.word0
+        self.word0 = 0
+    self.hv[0] = self.c4.bit_and(255) * 65599 + 1
+    self.hv[1] = self.c4.bit_and(65535) * 31 + 2
+    self.hv[2] = fold(self.c4.bit_and(16777215) * 2246822519) + 3
+    self.hv[3] = fold(self.c4.shr(16) * 2246822519 + self.c4.bit_and(65535) * 3266489917) + 4
+    self.hv[4] = fold(self.c4.bit_xor(self.c8.bit_and(65535) * 2654435761)) + 5
+    n := self.buf.len()
+    if self.exe == 0
+        self.hv[5] = fold(self.word0 * 2654435761) + 6
+        self.hv[6] = fold(self.word0.bit_xor(self.word1 * 1000003) * 97) + 7
     else
         # Machine code: bytes 1 and 3 back (an opcode and its operand around a
         # ModRM byte), and the column in a 4-byte word with the bytes 4 and 8 back
         # (the same field of the previous instructions on ARM64, table entries on x86).
-        hv[5] = fold((c4.bit_and(16711935) + 16777216) * 2654435761) + 6
-        hv[6] = fold((n.bit_and(3) + c4.shr(24).shl(2) + c8.shr(24).shl(10)) * 2246822519) + 7
-    hv[7] = fold(c4.shr(8).bit_and(65535) * 2246822519) + 8
-    if mlen > 0 and buf[mptr].to_int() == b
-        mlen += 1
-        mptr += 1
+        self.hv[5] = fold((self.c4.bit_and(16711935) + 16777216) * 2654435761) + 6
+        self.hv[6] = fold((n.bit_and(3) + self.c4.shr(24).shl(2) + self.c8.shr(24).shl(10)) * 2246822519)
+            + 7
+    self.hv[7] = fold(self.c4.shr(8).bit_and(65535) * 2246822519) + 8
+    if self.mlen > 0 and self.buf[self.mptr].to_int() == b
+        self.mlen += 1
+        self.mptr += 1
     else
-        mlen = 0
-    h := (fold(c4 + c8.bit_and(255).shl(32)) * 789008181).shr(20).bit_and((1).shl(mbits) - 1)
-    if mlen == 0
-        cand := mtab[h].to_int()
+        self.mlen = 0
+    h := (fold(self.c4 + self.c8.bit_and(255).shl(32)) * 789008181)
+        .shr(20)
+        .bit_and((1).shl(self.mbits) - 1)
+    if self.mlen == 0
+        cand := self.mtab[h].to_int()
         if cand > 0
             mut k := 0
-            while k < 32 and cand - 1 - k >= 0 and buf[cand - 1 - k] == buf[n - 1 - k]
+            while k < 32 and cand - 1 - k >= 0 and self.buf[cand - 1 - k] == self.buf[n - 1 - k]
                 k += 1
             if k >= 5
-                mlen = k
-                mptr = cand
-    mtab[h] = n.to_u32()
+                self.mlen = k
+                self.mptr = cand
+    self.mtab[h] = n.to_u32()
 
 struct Coder
     out List[u8]
