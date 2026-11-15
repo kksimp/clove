@@ -191,18 +191,18 @@ struct Bits
     n int
 
 fn Bits.put(mut self, v int, k int)
-    acc = acc.bit_or(v.shl(n))
-    n += k
-    while n >= 8
-        out.push(acc.bit_and(255).to_u8())
-        acc = acc.shr(8)
-        n -= 8
+    self.acc = self.acc.bit_or(v.shl(self.n))
+    self.n += k
+    while self.n >= 8
+        self.out.push(self.acc.bit_and(255).to_u8())
+        self.acc = self.acc.shr(8)
+        self.n -= 8
 
 fn Bits.finish(mut self)
-    if n > 0
-        out.push(acc.bit_and(255).to_u8())
-        acc = 0
-        n = 0
+    if self.n > 0
+        self.out.push(self.acc.bit_and(255).to_u8())
+        self.acc = 0
+        self.n = 0
 
 fn hash4(d List[u8], pos int) int
     v := d[pos].to_int()
